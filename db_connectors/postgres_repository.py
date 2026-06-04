@@ -23,6 +23,10 @@ class PostgresRepository:
             )
             self.cursor = self.connection.cursor()
             return True
+        except KeyboardInterrupt:
+            self.connection = None
+            self.cursor = None
+            return False
         except Exception:
             self.connection = None
             self.cursor = None
@@ -524,8 +528,8 @@ class PostgresRepository:
         for ec in end_cols:
             if self._table_has_columns(chosen_table, [ec]):
                 cols.append(ec); vals.append(end_date); break
-        if self._table_has_columns(chosen_table, ['estado']):
-            cols.append('estado'); vals.append(status)
+        if self._table_has_columns(chosen_table, ['estado_id']):
+            cols.append('estado_id'); vals.append(1)
         for ac in ['monto_total', 'monto', 'total_pagado', 'monto_pagado']:
             if amount is not None and self._table_has_columns(chosen_table, [ac]):
                 cols.append(ac)
@@ -538,7 +542,7 @@ class PostgresRepository:
         try:
             if query:
                 self.cursor.execute(query, tuple(vals))
-                inserted_row = self.cursor.fetchone() if self._table_has_columns(chosen_table, ['id']) else None
+                inserted_row = self.cursor.fetchone()
                 inserted = inserted_row[0] if inserted_row else None
                 self.connection.commit()
                 return {'created': True, 'id': inserted, 'table': chosen_table}
@@ -550,7 +554,7 @@ class PostgresRepository:
                 self._sync_identity_sequence(chosen_table)
                 if query:
                     self.cursor.execute(query, tuple(vals))
-                    inserted_row = self.cursor.fetchone() if self._table_has_columns(chosen_table, ['id']) else None
+                    inserted_row = self.cursor.fetchone()
                     inserted = inserted_row[0] if inserted_row else None
                     self.connection.commit()
                     return {'created': True, 'id': inserted, 'table': chosen_table}

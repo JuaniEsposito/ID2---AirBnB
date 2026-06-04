@@ -940,7 +940,9 @@ el método de pago y el estado de la transacción.
 
         return int(propiedad_pg_id) if str(propiedad_pg_id).isdigit() else propiedad_pg_id
 
-    def realizar_reserva_business(self, usuario_id, propiedad_id, inicio, fin, monto=None):
+    def realizar_reserva_business(self, usuario_id, propiedad_id, inicio, fin, monto=None, metodo_pago_id=None):
+        print(f"DEBUG entrada: metodo_pago_id={metodo_pago_id}")  # agregar esta línea
+
         # 1) Insert reserva en Postgres (fuente de verdad)
         try:
             resolved_user_id = self._resolver_usuario_postgres(usuario_id)
@@ -970,6 +972,27 @@ el método de pago y el estado de la transacción.
         precio_por_noche = self._obtener_precio_por_noche_propiedad(propiedad_id)
         disponibilidad_propiedad_id = str(resolved_property_id)
 
+
+        print(f"DEBUG pg_res: {pg_res}")
+        print(f"DEBUG reserva_id: {reserva_id}")
+        # 1.b) Ajustar estados iniciales
+        pago_result = None
+        import psycopg2 
+        try:
+            conn2 = psycopg2.connect(self.postgres.dsn, sslmode="require", connect_timeout=10)
+            cur2 = conn2.cursor()
+            cur2.execute("UPDATE reserva SET estado_id = 1 WHERE id = %s;", (reserva_id,))
+            if metodo_pago_id is not None:
+                cur2.execute(
+                    "INSERT INTO pago (reserva_id, monto, fecha_pago, metodo_pago_id, estado_pago_id) VALUES (%s, %s, NOW(), %s, 1)",
+                    (reserva_id, monto_calculado, int(metodo_pago_id))
+                )
+                pago_result = {'created': True}
+            conn2.commit()
+            cur2.close()
+            conn2.close()
+        except Exception as e:
+            print(f"ERROR PAGO: {e}")
         # 2) Marcar disponibilidad en Cassandra/Redis. Si Cassandra falla, la reserva sigue y se informa warning.
         start = datetime.fromisoformat(inicio).date()
         end = datetime.fromisoformat(fin).date()
@@ -997,10 +1020,141 @@ el método de pago y el estado de la transacción.
 
             current += timedelta(days=1)
 
-        result = {'postgres': pg_res, 'reserva_id': reserva_id, 'monto_calculado': monto_calculado}
+        result = {
+            'postgres': pg_res,
+            'reserva_id': reserva_id,
+            'monto_calculado': monto_calculado,
+            'pago': pago_result,
+        }
         if warnings:
             result['warning'] = " | ".join(warnings)
         return result
+
+    def confirmar_pago(self, reserva_id):
+        if getattr(self.postgres, 'connection', None) is None or getattr(self.postgres, 'cursor', None) is None:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        try:
+            reserva_id_int = int(reserva_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "mensaje": "reserva_id inválido."}
+
+        cursor = self.postgres.cursor
+        connection = self.postgres.connection
+
+        try:
+            cursor.execute(
+                """
+                UPDATE pago
+                SET estado_pago_id = 2
+                WHERE reserva_id = %s;
+                """,
+                (reserva_id_int,),
+            )
+            pagos_actualizados = cursor.rowcount or 0
+
+            cursor.execute(
+                """
+                UPDATE reserva
+                SET estado_id = 2
+                WHERE id = %s;
+                """,
+                (reserva_id_int,),
+            )
+            reservas_actualizadas = cursor.rowcount or 0
+
+            connection.commit()
+            return {
+                "ok": True,
+                "mensaje": "Pago confirmado y reserva actualizada a confirmada.",
+                "pagos_actualizados": int(pagos_actualizados),
+                "reservas_actualizadas": int(reservas_actualizadas),
+            }
+        except Exception as e:
+            connection.rollback()
+            return {"ok": False, "mensaje": f"Error al confirmar pago: {e}"}
+
+    def cancelar_reserva(self, reserva_id, usuario_id=None):
+        if getattr(self.postgres, 'connection', None) is None or getattr(self.postgres, 'cursor', None) is None:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        try:
+            reserva_id_int = int(reserva_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "mensaje": "reserva_id inválido."}
+
+        cursor = self.postgres.cursor
+        connection = self.postgres.connection
+        usuario_id_int = None
+        if usuario_id is not None:
+            try:
+                usuario_id_int = int(usuario_id)
+            except (TypeError, ValueError):
+                return {"ok": False, "mensaje": "usuario_id inválido para validar titularidad de reserva."}
+
+        try:
+            cursor.execute(
+                """
+                SELECT estado_id, usuario_id
+                FROM reserva
+                WHERE id = %s
+                LIMIT 1;
+                """,
+                (reserva_id_int,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                connection.rollback()
+                return {"ok": False, "mensaje": f"No existe la reserva con id {reserva_id_int}."}
+
+            estado_actual = row[0]
+            usuario_reserva = row[1]
+
+            if usuario_id_int is not None:
+                try:
+                    usuario_reserva_int = int(usuario_reserva)
+                except (TypeError, ValueError):
+                    connection.rollback()
+                    return {"ok": False, "mensaje": "No se pudo validar el titular de la reserva."}
+
+                if usuario_reserva_int != usuario_id_int:
+                    connection.rollback()
+                    return {"ok": False, "mensaje": "La reserva no pertenece al usuario autenticado."}
+
+            if int(estado_actual) == 3:
+                connection.rollback()
+                return {"ok": False, "mensaje": "La reserva ya está cancelada."}
+
+            cursor.execute(
+                """
+                UPDATE reserva
+                SET estado_id = 3
+                WHERE id = %s;
+                """,
+                (reserva_id_int,),
+            )
+            reservas_actualizadas = cursor.rowcount or 0
+
+            cursor.execute(
+                """
+                UPDATE pago
+                SET estado_pago_id = 3
+                WHERE reserva_id = %s;
+                """,
+                (reserva_id_int,),
+            )
+            pagos_actualizados = cursor.rowcount or 0
+
+            connection.commit()
+            return {
+                "ok": True,
+                "mensaje": "Reserva cancelada y pago marcado como rechazado.",
+                "reservas_actualizadas": int(reservas_actualizadas),
+                "pagos_actualizados": int(pagos_actualizados),
+            }
+        except Exception as e:
+            connection.rollback()
+            return {"ok": False, "mensaje": f"Error al cancelar reserva: {e}"}
 
     def dejar_resena_business(self, usuario_id, propiedad_id, texto, rating):
         resolved_user_id = self._resolver_usuario_postgres(usuario_id)
@@ -1120,31 +1274,180 @@ el método de pago y el estado de la transacción.
 
     def create_payment(self, amount, reserva_id, status='pendiente', method=None, ciudad=None, referencia_externa=None):
         try:
+            metodo_param = method
+            if method not in (None, "") and str(method).strip().isdigit() and getattr(self.postgres, 'cursor', None) is not None:
+                self.postgres.cursor.execute(
+                    """
+                    SELECT nombre
+                    FROM metodo_pago
+                    WHERE id = %s AND activo = TRUE
+                    LIMIT 1;
+                    """,
+                    (int(str(method).strip()),),
+                )
+                metodo_row = self.postgres.cursor.fetchone()
+                if not metodo_row:
+                    raise ValueError("Método de pago inválido o inactivo.")
+                metodo_param = metodo_row[0]
+
             return self.postgres.create_payment(
                 amount,
                 reserva_id,
                 status=status,
-                method=method,
+                method=metodo_param,
                 ciudad=ciudad,
                 referencia_externa=referencia_externa,
             )
         except Exception as e:
             raise
 
+    def _mostrar_reservas_menu(self, solo_pendientes=True, usuario_id=None, titulo_personalizado=None, anfitrion_id=None):
+        if getattr(self.postgres, 'connection', None) is None or getattr(self.postgres, 'cursor', None) is None:
+            print("No hay conexión a Postgres para listar reservas.")
+            return []
+
+        cursor = self.postgres.cursor
+        titulo = titulo_personalizado or ("Reservas pendientes:" if solo_pendientes else "Reservas no canceladas:")
+
+        try:
+            where_clauses = ["r.estado_id = 1" if solo_pendientes else "r.estado_id <> 3"]
+            params = []
+            if usuario_id is not None:
+                where_clauses.append("r.usuario_id = %s")
+                params.append(int(usuario_id))
+
+            join_clause = ""
+            if anfitrion_id is not None:
+                join_clause = "JOIN propiedad p ON p.id = r.propiedad_id"
+                where_clauses.append("p.anfitrion_id = %s")
+                params.append(int(anfitrion_id))
+
+            query = f"""
+                SELECT r.id, r.propiedad_id, r.fecha_inicio, r.fecha_fin, r.monto_total
+                FROM reserva r
+                {join_clause}
+                WHERE {' AND '.join(where_clauses)}
+                ORDER BY r.id DESC
+            """
+
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall() or []
+
+            print(f"\n{titulo}")
+            print("ID  | Propiedad | Fecha inicio | Fecha fin  | Monto")
+            print("--------------------------------------------------")
+            if not rows:
+                print("(sin resultados)")
+                return []
+
+            for row in rows:
+                reserva_id, propiedad_id, fecha_inicio, fecha_fin, monto = row
+                fecha_inicio_texto = fecha_inicio.isoformat() if hasattr(fecha_inicio, 'isoformat') else str(fecha_inicio)
+                fecha_fin_texto = fecha_fin.isoformat() if hasattr(fecha_fin, 'isoformat') else str(fecha_fin)
+                print(f"{str(reserva_id):<3} | {str(propiedad_id):>9} | {fecha_inicio_texto:<11} | {fecha_fin_texto:<10} | {monto}")
+            return rows
+        except Exception as e:
+            try:
+                self.postgres.connection.rollback()
+            except Exception:
+                pass
+            print(f"No se pudieron listar reservas: {e}")
+            return []
+
+    def _mostrar_reservas_anfitrion(self, active_session=None):
+        if getattr(self.postgres, 'connection', None) is None or getattr(self.postgres, 'cursor', None) is None:
+            print("No hay conexión a Postgres para listar reservas del anfitrión.")
+            return
+
+        email = self._normalize_email(active_session.get('email') if isinstance(active_session, dict) else None)
+        if not email:
+            print("No se encontró email de sesión para identificar al anfitrión.")
+            return
+
+        try:
+            usuario = self.postgres.get_user_by_email(email)
+        except Exception as e:
+            print(f"No se pudo resolver anfitrión por email: {e}")
+            return
+
+        anfitrion_id = usuario.get('id') if isinstance(usuario, dict) else None
+        if anfitrion_id is None:
+            print("No existe un usuario anfitrión en Postgres para el email de la sesión activa.")
+            return
+
+        cursor = self.postgres.cursor
+        try:
+            cursor.execute(
+                """
+                SELECT r.id, r.usuario_id, r.propiedad_id, r.fecha_inicio, r.fecha_fin, r.monto_total, r.estado_id
+                FROM reserva r
+                WHERE r.propiedad_id IN (SELECT id FROM propiedad WHERE anfitrion_id = %s)
+                ORDER BY r.id DESC
+                """,
+                (int(anfitrion_id),),
+            )
+            rows = cursor.fetchall() or []
+
+            print("\nReservas de mis propiedades:")
+            print("ID  | Usuario | Propiedad | Fecha inicio | Fecha fin  | Monto | Estado")
+            print("-----------------------------------------------------------------------")
+            if not rows:
+                print("(sin resultados)")
+                return
+
+            for row in rows:
+                reserva_id, usuario_id, propiedad_id, fecha_inicio, fecha_fin, monto, estado_id = row
+                fecha_inicio_texto = fecha_inicio.isoformat() if hasattr(fecha_inicio, 'isoformat') else str(fecha_inicio)
+                fecha_fin_texto = fecha_fin.isoformat() if hasattr(fecha_fin, 'isoformat') else str(fecha_fin)
+                print(
+                    f"{str(reserva_id):<3} | {str(usuario_id):>7} | {str(propiedad_id):>9} | "
+                    f"{fecha_inicio_texto:<11} | {fecha_fin_texto:<10} | {monto} | {estado_id}"
+                )
+        except Exception as e:
+            try:
+                self.postgres.connection.rollback()
+            except Exception:
+                pass
+            print(f"No se pudieron listar reservas del anfitrión: {e}")
+
+    def _tipo_menu_requerimientos(self, active_session=None):
+        raw_tipo = (active_session.get('tipo') if isinstance(active_session, dict) else None)
+        tipo = (raw_tipo or '').strip().casefold()
+        if tipo in {'huesped', 'anfitrion', 'ambos'}:
+            return tipo
+
+        normalizado = self._tipo_usuario_sesion(active_session)
+        if normalizado in {'huesped', 'anfitrion'}:
+            return normalizado
+        return 'huesped'
+
     def menu_requerimientos(self, active_session=None):
         while True:
-            tipo_usuario = self._tipo_usuario_sesion(active_session)
-            es_anfitrion = tipo_usuario == "anfitrion"
-            es_huesped = tipo_usuario == "huesped"
+            tipo_usuario = self._tipo_menu_requerimientos(active_session)
 
-            opciones = []
-            if es_anfitrion:
-                opciones.append(("1", "Publicar propiedad (MongoDB)"))
-            if es_huesped:
-                opciones.append(("1", "Realizar reserva (Postgres + Cassandra + Redis)"))
-                opciones.append(("2", "Dejar reseña (Mongo + actualizar promedio en Postgres si aplica)"))
-            if es_anfitrion:
-                opciones.append(("3", "Crear pago/transacción asociada a una reserva (Postgres)"))
+            if tipo_usuario == 'huesped':
+                opciones = [
+                    ("1", "Hacer reserva (Postgres + Cassandra + Redis)"),
+                    ("2", "Cancelar mi reserva (Postgres)"),
+                    ("3", "Dejar reseña (Mongo + Postgres)"),
+                ]
+            elif tipo_usuario == 'anfitrion':
+                opciones = [
+                    ("1", "Publicar propiedad (MongoDB + Postgres)"),
+                    ("2", "Ver reservas de mis propiedades (Postgres)"),
+                    ("3", "Confirmar pago de una reserva (Postgres)"),
+                    ("4", "Cancelar reserva (Postgres)"),
+                ]
+            else:
+                opciones = [
+                    ("1", "Hacer reserva (Postgres + Cassandra + Redis)"),
+                    ("2", "Cancelar mi reserva (Postgres)"),
+                    ("3", "Dejar reseña (Mongo + Postgres)"),
+                    ("4", "Publicar propiedad (MongoDB + Postgres)"),
+                    ("5", "Ver reservas de mis propiedades (Postgres)"),
+                    ("6", "Confirmar pago de una reserva (Postgres)"),
+                    ("7", "Cancelar reserva (Postgres)"),
+                ]
 
             print("\n" + "=" * 30)
             print("=== REQUERIMIENTOS DEL SISTEMA ===")
@@ -1157,7 +1460,32 @@ el método de pago y el estado de la transacción.
             opc = input("\nSeleccione una opción: ").strip()
             if opc == "0":
                 return
-            if opc == "1" and es_anfitrion:
+
+            if tipo_usuario == 'huesped':
+                accion = {
+                    "1": "hacer_reserva",
+                    "2": "cancelar_mi_reserva",
+                    "3": "dejar_resena",
+                }.get(opc)
+            elif tipo_usuario == 'anfitrion':
+                accion = {
+                    "1": "publicar_propiedad",
+                    "2": "ver_reservas_anfitrion",
+                    "3": "confirmar_pago",
+                    "4": "cancelar_reserva",
+                }.get(opc)
+            else:
+                accion = {
+                    "1": "hacer_reserva",
+                    "2": "cancelar_mi_reserva",
+                    "3": "dejar_resena",
+                    "4": "publicar_propiedad",
+                    "5": "ver_reservas_anfitrion",
+                    "6": "confirmar_pago",
+                    "7": "cancelar_reserva",
+                }.get(opc)
+
+            if accion == "publicar_propiedad":
                 print("\n--- Publicar propiedad (MongoDB) ---")
                 anfitrion = input("Anfitrión ID: ").strip() or (active_session.get('email') if active_session else None)
                 titulo = input("Título: ").strip()
@@ -1215,21 +1543,156 @@ el método de pago y el estado de la transacción.
                     print("=" * 50)
                 except Exception as e:
                     print(f"✗ Error publicando propiedad: {e}")
-            elif opc == "1" and es_huesped:
+            elif accion == "hacer_reserva":
                 print("\n--- Realizar reserva (Postgres + Cassandra + Redis) ---")
-                usuario = input("Usuario ID o email (Enter para usar sesión): ").strip() or (active_session.get('email') if active_session else None)
-                propiedad = input("Property ID (maestro o identificador): ").strip()
+
+                if getattr(self.mongo, 'collection', None) is None:
+                    print("MongoDB no está disponible para buscar propiedades.")
+                    continue
+
+                pais = input("¿En qué país? (Argentina/Brasil/Chile, Enter para todos): ").strip() or None
+                ciudad = input("¿En qué ciudad? (Enter para todas): ").strip() or None
+                tipo = input("¿Tipo de propiedad? (Departamento/Casa/Cabaña/Loft/Habitación, Enter para cualquiera): ").strip() or None
+                precio_max = input("¿Precio máximo por noche en USD? (Enter para cualquiera): ").strip() or None
+
+                query = {"activa": True}
+                if pais:
+                    query["ubicacion.pais"] = {"$regex": pais, "$options": "i"}
+                if ciudad:
+                    query["ubicacion.ciudad"] = {"$regex": ciudad, "$options": "i"}
+                if tipo:
+                    query["tipo_propiedad"] = {"$regex": tipo, "$options": "i"}
+                if precio_max:
+                    try:
+                        query["precio_por_noche"] = {"$lte": float(precio_max)}
+                    except ValueError:
+                        print("Precio máximo inválido.")
+                        continue
+
+                try:
+                    resultados = list(self.mongo.collection.find(query).limit(10))
+                except Exception as e:
+                    print(f"Error consultando propiedades en MongoDB: {e}")
+                    continue
+
+                if not resultados:
+                    print("No se encontraron propiedades con esos filtros")
+                    continue
+
+                print("\nPropiedades encontradas:")
+                print("─" * 45)
+                for idx, prop in enumerate(resultados, start=1):
+                    ubicacion = prop.get("ubicacion") if isinstance(prop.get("ubicacion"), dict) else {}
+                    tipo_propiedad = prop.get("tipo_propiedad") or "Propiedad"
+                    referencia = prop.get("barrio") or ubicacion.get("ciudad") or "Ubicación sin detalle"
+                    ciudad_prop = ubicacion.get("ciudad") or "N/D"
+                    pais_prop = ubicacion.get("pais") or "N/D"
+                    precio_noche = prop.get("precio_por_noche")
+                    huespedes = prop.get("huespedes_max") if prop.get("huespedes_max") is not None else "N/D"
+                    habitaciones = prop.get("cant_habitaciones") if prop.get("cant_habitaciones") is not None else "N/D"
+                    banios = prop.get("cant_banios") if prop.get("cant_banios") is not None else "N/D"
+                    servicios_raw = prop.get("servicios")
+                    if isinstance(servicios_raw, list):
+                        servicios = ", ".join(str(item) for item in servicios_raw[:4]) if servicios_raw else "N/D"
+                    elif isinstance(servicios_raw, str):
+                        servicios = servicios_raw or "N/D"
+                    else:
+                        servicios = "N/D"
+                    rating = prop.get("calificacion_promedio")
+                    rating_texto = f"{float(rating):.1f}" if isinstance(rating, (int, float)) else "N/D"
+                    zona_centrica = "Sí" if bool(prop.get("zona_centrica")) else "No"
+                    precio_texto = f"${precio_noche}/noche" if precio_noche is not None else "Precio no disponible"
+
+                    print(f"{idx}. {tipo_propiedad} en {referencia}")
+                    print(f"   Ciudad: {ciudad_prop}, {pais_prop} | Precio: {precio_texto}")
+                    print(f"   Huéspedes: {huespedes} | Habitaciones: {habitaciones} | Baños: {banios}")
+                    print(f"   Servicios: {servicios}")
+                    print(f"   Rating: {rating_texto} ⭐ | Zona céntrica: {zona_centrica}")
+                    print("─" * 45)
+
+                seleccion_valida = None
+                while True:
+                    seleccion = input("Seleccione una propiedad (número) o 0 para volver: ").strip()
+                    if seleccion == "0":
+                        break
+                    if not seleccion.isdigit():
+                        print("Selección inválida. Debe ingresar un número.")
+                        continue
+
+                    indice = int(seleccion)
+                    if indice < 1 or indice > len(resultados):
+                        print("Selección inválida. El número está fuera de rango.")
+                        continue
+
+                    seleccion_valida = resultados[indice - 1]
+                    break
+
+                if seleccion_valida is None:
+                    continue
+
+                propiedad_pg_id = seleccion_valida.get("propiedad_pg_id")
+                if propiedad_pg_id is None:
+                    print("Esta propiedad no está disponible para reservar")
+                    continue
+
+                usuario_email = (active_session.get('email') if active_session else None)
+                if not usuario_email:
+                    usuario_email = input("Usuario ID o email: ").strip() or None
+                if not usuario_email:
+                    print("No se pudo resolver el usuario para la reserva.")
+                    continue
+
                 inicio = input("Fecha inicio (YYYY-MM-DD): ").strip()
                 fin = input("Fecha fin (YYYY-MM-DD): ").strip()
+
+                if getattr(self.postgres, 'cursor', None) is None:
+                    print("No hay conexión a Postgres para consultar métodos de pago.")
+                    continue
+
                 try:
-                    res = self.realizar_reserva_business(usuario, propiedad, inicio, fin)
+                    self.postgres.cursor.execute("SELECT id, nombre FROM metodo_pago WHERE activo = TRUE")
+                    metodos = self.postgres.cursor.fetchall() or []
+                except Exception as e:
+                    try:
+                        if getattr(self.postgres, 'connection', None) is not None:
+                            self.postgres.connection.rollback()
+                    except Exception:
+                        pass
+                    print(f"No se pudieron consultar métodos de pago: {e}")
+                    continue
+
+                if not metodos:
+                    print("No hay métodos de pago activos para continuar con la reserva.")
+                    continue
+
+                print("\n¿Con qué método querés pagar?")
+                for m in metodos:
+                    print(f"{m[0]}. {m[1]}")
+
+                metodo_id = input("Seleccione método de pago: ").strip()
+                metodos_validos = {str(m[0]) for m in metodos}
+                if metodo_id not in metodos_validos:
+                    print("Método de pago inválido.")
+                    continue
+
+                try:
+                    res = self.realizar_reserva_business(
+                        usuario_email,
+                        propiedad_pg_id,
+                        inicio,
+                        fin,
+                        metodo_pago_id=metodo_id,
+                    )
                     print("\n" + "=" * 50)
                     print("✓ ¡Reserva realizada exitosamente!")
                     print("=" * 50)
                     print(f"  Monto total: ${res.get('monto_calculado', 0):.2f}")
                     postgres_info = res.get('postgres', {})
                     if postgres_info.get('created'):
-                        print(f"  Estado: Confirmada en Postgres")
+                        print("  Estado inicial: Pendiente")
+                        pago_info = res.get('pago', {}) if isinstance(res, dict) else {}
+                        if isinstance(pago_info, dict) and pago_info.get('created'):
+                            print("  Pago inicial: Pendiente")
                         if postgres_info.get('id'):
                             print(f"  ID Reserva: {postgres_info.get('id')}")
                     else:
@@ -1237,7 +1700,38 @@ el método de pago y el estado de la transacción.
                     print("=" * 50)
                 except Exception as e:
                     print(f"Error realizando reserva: {e}")
-            elif opc == "2" and es_huesped:
+            elif accion == "cancelar_mi_reserva":
+                print("\n--- Cancelar mi reserva (Postgres) ---")
+                usuario_sesion = self._resolver_usuario_postgres(active_session.get('email') if active_session else None)
+                if usuario_sesion is None:
+                    print("No se pudo resolver el usuario de sesión en Postgres.")
+                    continue
+
+                self._mostrar_reservas_menu(
+                    solo_pendientes=False,
+                    usuario_id=usuario_sesion,
+                    titulo_personalizado="Mis reservas no canceladas:",
+                )
+                reserva_id = input("Reserva ID a cancelar: ").strip()
+                if not reserva_id:
+                    print("Error: debe ingresar una reserva_id válida.")
+                    continue
+
+                try:
+                    res = self.cancelar_reserva(int(reserva_id), usuario_id=usuario_sesion)
+                    if res.get("ok"):
+                        print("\n" + "=" * 50)
+                        print("✓ ¡Reserva cancelada exitosamente!")
+                        print("=" * 50)
+                        print(f"  Reserva ID: {reserva_id}")
+                        print(f"  Reservas actualizadas: {res.get('reservas_actualizadas', 0)}")
+                        print(f"  Pagos actualizados: {res.get('pagos_actualizados', 0)}")
+                        print("=" * 50)
+                    else:
+                        print(f"Error cancelando reserva: {res.get('mensaje', 'Error desconocido')}")
+                except Exception as e:
+                    print(f"Error cancelando reserva: {e}")
+            elif accion == "dejar_resena":
                 print("\n--- Dejar reseña (Mongo + Postgres update) ---")
                 usuario = input("Usuario ID o email (Enter para usar sesión): ").strip() or (active_session.get('email') if active_session else None)
                 propiedad = input("Property _id: ").strip()
@@ -1272,47 +1766,101 @@ el método de pago y el estado de la transacción.
                     print("=" * 50)
                 except Exception as e:
                     print(f"Error dejando reseña: {e}")
-            elif opc == "3" and es_anfitrion:
-                print("\n--- Crear pago/transacción asociada a una reserva (Postgres) ---")
-                monto = input("Monto: ").strip() or "0"
-                reserva_id = input("Reserva ID asociada: ").strip()
-                if not reserva_id:
-                    print("Error creando pago: debe ingresar una reserva_id válida.")
-                    continue
-                
-                print("\nSeleccione el estado:")
-                print("1. Pendiente")
-                print("2. Pagado")
-                print("3. Cancelado")
-                estado_opc = input("Estado (1-3, Enter para 'pendiente'): ").strip() or "1"
-                estado_map = {"1": "pendiente", "2": "pagado", "3": "cancelado"}
-                estado = estado_map.get(estado_opc, "pendiente")
-                
-                print("\nSeleccione el método de pago:")
-                print("1. Tarjeta")
-                print("2. Efectivo")
-                print("3. Transferencia")
-                metodo_opc = input("Método (1-3, Enter para omitir): ").strip() or ""
-                metodo_map = {"1": "tarjeta", "2": "efectivo", "3": "transferencia"}
-                metodo = metodo_map.get(metodo_opc, None) if metodo_opc else None
-                
-                ciudad = input("Ciudad (opcional): ").strip() or None
+            elif accion == "ver_reservas_anfitrion":
+                print("\n--- Ver reservas de mis propiedades (Postgres) ---")
+                self._mostrar_reservas_anfitrion(active_session)
+            elif accion == "confirmar_pago":
+                print("\n--- Confirmar pago de una reserva (Postgres) ---")
                 try:
-                    res = self.create_payment(float(monto), int(reserva_id), status=estado, method=metodo, ciudad=ciudad)
-                    print("\n" + "=" * 50)
-                    print("✓ ¡Pago creado exitosamente!")
-                    print("=" * 50)
-                    print(f"  ID Pago: {res.get('id')}")
-                    print(f"  Estado: {estado}")
-                    print(f"  Monto: ${float(monto):.2f}")
-                    print(f"  Reserva ID: {reserva_id}")
-                    if metodo:
-                        print(f"  Método: {metodo}")
-                    if ciudad:
-                        print(f"  Ciudad: {ciudad}")
-                    print("=" * 50)
+                    usuario = self.postgres.get_user_by_email(active_session.get('email') if active_session else None)
                 except Exception as e:
-                    print(f"Error creando pago: {e}")
+                    print(f"No se pudo resolver el anfitrión de la sesión activa: {e}")
+                    continue
+                anfitrion_id = usuario.get('id') if isinstance(usuario, dict) else None
+                if anfitrion_id is None:
+                    print("No se pudo resolver el anfitrión de la sesión activa.")
+                    continue
+
+                reservas_visibles = self._mostrar_reservas_menu(
+                    solo_pendientes=True,
+                    anfitrion_id=anfitrion_id,
+                    titulo_personalizado="Reservas pendientes de mis propiedades:",
+                )
+                reserva_id = input("Reserva ID: ").strip()
+                if not reserva_id:
+                    print("Error: debe ingresar una reserva_id válida.")
+                    continue
+                if not reserva_id.isdigit():
+                    print("Error: la reserva_id debe ser numérica.")
+                    continue
+
+                reserva_id_int = int(reserva_id)
+
+                reservas_permitidas = {int(row[0]) for row in reservas_visibles if row and row[0] is not None}
+                if reservas_permitidas and reserva_id_int not in reservas_permitidas:
+                    print("Error: la reserva seleccionada no pertenece a propiedades del anfitrión logueado.")
+                    continue
+
+                try:
+                    res = self.confirmar_pago(reserva_id_int)
+                    if res.get("ok"):
+                        print("\n" + "=" * 50)
+                        print("✓ ¡Pago confirmado exitosamente!")
+                        print("=" * 50)
+                        print(f"  Reserva ID: {reserva_id}")
+                        print(f"  Pagos actualizados: {res.get('pagos_actualizados', 0)}")
+                        print(f"  Reservas actualizadas: {res.get('reservas_actualizadas', 0)}")
+                        print("=" * 50)
+                    else:
+                        print(f"Error confirmando pago: {res.get('mensaje', 'Error desconocido')}")
+                except Exception as e:
+                    print(f"Error confirmando pago: {e}")
+            elif accion == "cancelar_reserva":
+                print("\n--- Cancelar reserva (Postgres) ---")
+                try:
+                    usuario = self.postgres.get_user_by_email(active_session.get('email') if active_session else None)
+                except Exception as e:
+                    print(f"No se pudo resolver el anfitrión de la sesión activa: {e}")
+                    continue
+                anfitrion_id = usuario.get('id') if isinstance(usuario, dict) else None
+                if anfitrion_id is None:
+                    print("No se pudo resolver el anfitrión de la sesión activa.")
+                    continue
+
+                reservas_visibles = self._mostrar_reservas_menu(
+                    solo_pendientes=False,
+                    anfitrion_id=anfitrion_id,
+                    titulo_personalizado="Reservas no canceladas de mis propiedades:",
+                )
+                reserva_id = input("Reserva ID: ").strip()
+                if not reserva_id:
+                    print("Error: debe ingresar una reserva_id válida.")
+                    continue
+                if not reserva_id.isdigit():
+                    print("Error: la reserva_id debe ser numérica.")
+                    continue
+
+                reserva_id_int = int(reserva_id)
+
+                reservas_permitidas = {int(row[0]) for row in reservas_visibles if row and row[0] is not None}
+                if reservas_permitidas and reserva_id_int not in reservas_permitidas:
+                    print("Error: la reserva seleccionada no pertenece a propiedades del anfitrión logueado.")
+                    continue
+
+                try:
+                    res = self.cancelar_reserva(reserva_id_int)
+                    if res.get("ok"):
+                        print("\n" + "=" * 50)
+                        print("✓ ¡Reserva cancelada exitosamente!")
+                        print("=" * 50)
+                        print(f"  Reserva ID: {reserva_id}")
+                        print(f"  Reservas actualizadas: {res.get('reservas_actualizadas', 0)}")
+                        print(f"  Pagos actualizados: {res.get('pagos_actualizados', 0)}")
+                        print("=" * 50)
+                    else:
+                        print(f"Error cancelando reserva: {res.get('mensaje', 'Error desconocido')}")
+                except Exception as e:
+                    print(f"Error cancelando reserva: {e}")
             else:
                 print("\n⚠ Opción no válida para el tipo de usuario actual. Intente nuevamente.")
 

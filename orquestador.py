@@ -1279,12 +1279,38 @@ el método de pago y el estado de la transacción.
                 if not reserva_id:
                     print("Error creando pago: debe ingresar una reserva_id válida.")
                     continue
-                estado = input("Estado (ej: pendiente): ").strip() or 'pendiente'
-                metodo = input("Método de pago (opcional): ").strip() or None
+                
+                print("\nSeleccione el estado:")
+                print("1. Pendiente")
+                print("2. Pagado")
+                print("3. Cancelado")
+                estado_opc = input("Estado (1-3, Enter para 'pendiente'): ").strip() or "1"
+                estado_map = {"1": "pendiente", "2": "pagado", "3": "cancelado"}
+                estado = estado_map.get(estado_opc, "pendiente")
+                
+                print("\nSeleccione el método de pago:")
+                print("1. Tarjeta")
+                print("2. Efectivo")
+                print("3. Transferencia")
+                metodo_opc = input("Método (1-3, Enter para omitir): ").strip() or ""
+                metodo_map = {"1": "tarjeta", "2": "efectivo", "3": "transferencia"}
+                metodo = metodo_map.get(metodo_opc, None) if metodo_opc else None
+                
                 ciudad = input("Ciudad (opcional): ").strip() or None
                 try:
                     res = self.create_payment(float(monto), int(reserva_id), status=estado, method=metodo, ciudad=ciudad)
-                    print(f"Pago creado: {res}")
+                    print("\n" + "=" * 50)
+                    print("✓ ¡Pago creado exitosamente!")
+                    print("=" * 50)
+                    print(f"  ID Pago: {res.get('id')}")
+                    print(f"  Estado: {estado}")
+                    print(f"  Monto: ${float(monto):.2f}")
+                    print(f"  Reserva ID: {reserva_id}")
+                    if metodo:
+                        print(f"  Método: {metodo}")
+                    if ciudad:
+                        print(f"  Ciudad: {ciudad}")
+                    print("=" * 50)
                 except Exception as e:
                     print(f"Error creando pago: {e}")
             else:

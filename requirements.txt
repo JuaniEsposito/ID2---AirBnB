@@ -1,0 +1,7 @@
+pymongo>=4.3,<5
+astrapy>=1.0,<2
+redis>=4.6,<5
+psycopg2-binary>=2.9,<3
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+pytest>=7.0,<8

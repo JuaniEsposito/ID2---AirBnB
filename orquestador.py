@@ -793,11 +793,24 @@ el método de pago y el estado de la transacción.
             zona_turistica = _norm_text(ciudad) in ciudades_turisticas
             zona_centrica = _norm_text(barrio) in barrios_centricos if barrio else False
 
-            # 3) Mongo: insertar documento enlazado con propiedad_pg_id.
+            # 3) Recuperar servicios confirmados desde Postgres (M:N) para desnormalizar en Mongo.
+            servicios_nombres = []
+            try:
+                servicios_nombres = self.postgres.get_servicios_by_propiedad(propiedad_pg_id)
+            except Exception:
+                # Fallback: usar los nombres que vinieron en el doc original
+                raw = property_doc.get("servicios")
+                if isinstance(raw, list):
+                    servicios_nombres = [str(s) for s in raw if s]
+                elif isinstance(raw, str) and raw.strip():
+                    servicios_nombres = [s.strip() for s in raw.split(",") if s.strip()]
+
+            # 4) Mongo: insertar documento enlazado con propiedad_pg_id y servicios desnormalizados.
             mongo_doc = dict(property_doc)
             mongo_doc["propiedad_pg_id"] = propiedad_pg_id
             mongo_doc["zona_turistica"] = zona_turistica
             mongo_doc["zona_centrica"] = zona_centrica
+            mongo_doc["servicios"] = servicios_nombres  # array de strings desnormalizado
 
             mongo_res = None
             try:
@@ -1501,7 +1514,38 @@ el método de pago y el estado de la transacción.
                 pais = input("País: ").strip()
                 latitud = input("Latitud (opcional): ").strip() or None
                 longitud = input("Longitud (opcional): ").strip() or None
-                servicios = input("Servicios (coma separados): ").strip() or ''
+
+                # Selección de servicios desde la tabla 'servicio' (M:N)
+                servicio_ids = []
+                try:
+                    if getattr(self.postgres, 'cursor', None) is not None:
+                        self.postgres.cursor.execute("SELECT id, nombre FROM servicio ORDER BY nombre;")
+                        servicios_catalogo = self.postgres.cursor.fetchall() or []
+                    else:
+                        servicios_catalogo = []
+                except Exception:
+                    try:
+                        if getattr(self.postgres, 'connection', None) is not None:
+                            self.postgres.connection.rollback()
+                    except Exception:
+                        pass
+                    servicios_catalogo = []
+
+                if servicios_catalogo:
+                    print("\nServicios disponibles:")
+                    for sid, snombre in servicios_catalogo:
+                        print(f"  {sid}. {snombre}")
+                    ids_input = input("Ingrese IDs de servicios separados por coma (Enter para ninguno): ").strip()
+                    if ids_input:
+                        for token in ids_input.split(','):
+                            token = token.strip()
+                            if token.isdigit() and any(int(token) == row[0] for row in servicios_catalogo):
+                                servicio_ids.append(int(token))
+                            elif token:
+                                print(f"  ⚠ ID '{token}' no válido, ignorado.")
+                else:
+                    print("⚠ No se pudo cargar el catálogo de servicios desde Postgres.")
+
                 fotos = input("Fotos (URLs separadas por coma, opcional): ").strip() or ''
                 doc = {
                     'titulo': titulo,
@@ -1516,7 +1560,7 @@ el método de pago y el estado de la transacción.
                     'barrio': barrio,
                     'calificacion_promedio': None,
                     'activa': True,
-                    'servicios': [s.strip() for s in servicios.split(',') if s.strip()],
+                    'servicio_ids': servicio_ids,
                     'fotos': [{'url': url.strip(), 'orden': index + 1} for index, url in enumerate([item for item in fotos.split(',') if item.strip()])],
                 }
                 if latitud or longitud:
@@ -1733,8 +1777,77 @@ el método de pago y el estado de la transacción.
                     print(f"Error cancelando reserva: {e}")
             elif accion == "dejar_resena":
                 print("\n--- Dejar reseña (Mongo + Postgres update) ---")
-                usuario = input("Usuario ID o email (Enter para usar sesión): ").strip() or (active_session.get('email') if active_session else None)
-                propiedad = input("Property _id: ").strip()
+                usuario_email = (active_session.get('email') if active_session else None)
+                usuario_pg_id = self._resolver_usuario_postgres(usuario_email)
+
+                # Listar propiedades que el usuario reservó (confirmadas o cualquier estado)
+                propiedades_reservadas = []
+                if usuario_pg_id is not None and getattr(self.postgres, 'cursor', None) is not None:
+                    try:
+                        self.postgres.cursor.execute(
+                            """
+                            SELECT DISTINCT r.propiedad_id
+                            FROM reserva r
+                            WHERE r.usuario_id = %s
+                            ORDER BY r.propiedad_id;
+                            """,
+                            (int(usuario_pg_id),),
+                        )
+                        propiedad_ids_pg = [row[0] for row in (self.postgres.cursor.fetchall() or [])]
+                    except Exception as e:
+                        try:
+                            self.postgres.connection.rollback()
+                        except Exception:
+                            pass
+                        print(f"No se pudieron obtener reservas: {e}")
+                        propiedad_ids_pg = []
+
+                    # Buscar cada propiedad en Mongo para obtener _id y título
+                    for pid in propiedad_ids_pg:
+                        try:
+                            doc = self.mongo.collection.find_one(
+                                {"propiedad_pg_id": pid},
+                                {"_id": 1, "titulo": 1, "tipo_propiedad": 1, "ubicacion": 1},
+                            )
+                            if doc:
+                                propiedades_reservadas.append(doc)
+                        except Exception:
+                            pass
+
+                if not propiedades_reservadas:
+                    print("No tenés propiedades reservadas para reseñar.")
+                    continue
+
+                print("\nPropiedades que reservaste:")
+                print("─" * 45)
+                for idx, prop in enumerate(propiedades_reservadas, start=1):
+                    titulo = prop.get("titulo") or "Sin título"
+                    tipo = prop.get("tipo_propiedad") or "Propiedad"
+                    ubicacion = prop.get("ubicacion") if isinstance(prop.get("ubicacion"), dict) else {}
+                    ciudad = ubicacion.get("ciudad") or "N/D"
+                    print(f"{idx}. {tipo}: {titulo} | {ciudad}")
+                print("─" * 45)
+
+                propiedad_mongo_id = None
+                while True:
+                    sel = input("Seleccione una propiedad (número) o 0 para volver: ").strip()
+                    if sel == "0":
+                        break
+                    if not sel.isdigit():
+                        print("Selección inválida.")
+                        continue
+                    idx_sel = int(sel)
+                    if idx_sel < 1 or idx_sel > len(propiedades_reservadas):
+                        print("Número fuera de rango.")
+                        continue
+                    propiedad_mongo_id = str(propiedades_reservadas[idx_sel - 1]["_id"])
+                    break
+
+                if propiedad_mongo_id is None:
+                    continue
+
+                propiedad = propiedad_mongo_id
+                usuario = usuario_email
                 rating = input("Calificación (0-5): ").strip() or '5'
                 comentario = input("Comentario: ").strip() or ''
                 puntaje_limpieza = input("Puntaje limpieza (0-5, Enter para omitir): ").strip() or None

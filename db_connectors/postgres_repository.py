@@ -856,6 +856,14 @@ class PostgresRepository:
             except Exception:
                 ubicacion_id = None
 
+            # Insertar servicios en tabla intermedia si se pasaron IDs
+            servicio_ids = normalized_doc.get('servicio_ids') or []
+            if inserted and servicio_ids:
+                try:
+                    self.insertar_propiedad_servicios(inserted, servicio_ids)
+                except Exception:
+                    pass  # No bloquear la publicación si falla la M:N
+
             return {
                 'created': True,
                 'id': inserted,
@@ -863,6 +871,57 @@ class PostgresRepository:
                 'tipo_propiedad_id': tipo_propiedad_id,
                 'ubicacion_id': ubicacion_id,
             }
+        except Psycopg2Error:
+            self.connection.rollback()
+            raise
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def get_servicios_by_propiedad(self, propiedad_id):
+        """Devuelve lista de nombres de servicios para una propiedad usando la tabla intermedia."""
+        if not self.connection or not self.cursor:
+            return []
+        try:
+            self.cursor.execute(
+                """
+                SELECT s.nombre
+                FROM servicio s
+                JOIN propiedad_servicio ps ON ps.servicio_id = s.id
+                WHERE ps.propiedad_id = %s
+                ORDER BY s.nombre;
+                """,
+                (int(propiedad_id),),
+            )
+            rows = self.cursor.fetchall() or []
+            return [row[0] for row in rows if row and row[0]]
+        except Exception:
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass
+            return []
+
+    def insertar_propiedad_servicios(self, propiedad_id, servicio_ids):
+        """Inserta filas en propiedad_servicio para la lista de servicio_ids dada."""
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+        if not servicio_ids:
+            return {"inserted": 0}
+        try:
+            inserted = 0
+            for sid in servicio_ids:
+                self.cursor.execute(
+                    """
+                    INSERT INTO propiedad_servicio (propiedad_id, servicio_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING;
+                    """,
+                    (int(propiedad_id), int(sid)),
+                )
+                inserted += self.cursor.rowcount or 0
+            self.connection.commit()
+            return {"inserted": inserted}
         except Psycopg2Error:
             self.connection.rollback()
             raise

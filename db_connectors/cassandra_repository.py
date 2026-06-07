@@ -41,12 +41,13 @@ class CassandraRepository:
             except Exception:
                 self.visits_table = None
             return True
-        except Exception:
+        except Exception as conn_err:
             self.client = None
             self.db = None
             self.collection = None
             self.availability_table = None
             self.visits_table = None
+            print(f"✗ Error Astra DB: {conn_err}")
             return False
 
     def _parse_date(self, value):
@@ -110,6 +111,80 @@ class CassandraRepository:
             "unavailable_days": unavailable_days,
             "days_checked": expected_days,
         }
+
+    def verificar_disponibilidad(self, propiedad_id, inicio, fin):
+        """Retorna False si existe algún día con disponible=False; True en otro caso."""
+        if self.availability_table is None:
+            raise RuntimeError("Tabla disponibilidad_propiedad no disponible.")
+
+        start = self._parse_date(inicio)
+        end = self._parse_date(fin)
+        if start > end:
+            raise ValueError("La fecha de inicio no puede ser mayor que la fecha de fin.")
+
+        rows = list(
+            self.availability_table.find(
+                {
+                    "propiedad_id": str(propiedad_id),
+                    "fecha": {"$gte": start, "$lte": end},
+                }
+            )
+        )
+
+        for row in rows:
+            if row.get("disponible") is False:
+                return False
+        return True
+
+    def block_dates(self, propiedad_id, inicio, fin, precio_noche=None):
+        """Inserta un registro por cada día del rango en disponibilidad_propiedad marcando disponible=False."""
+        if self.availability_table is None:
+            raise RuntimeError("Tabla disponibilidad_propiedad no disponible en Astra DB.")
+
+        start = self._parse_date(inicio)
+        end = self._parse_date(fin)
+        if start > end:
+            raise ValueError("La fecha de inicio no puede ser mayor que la fecha de fin.")
+
+        propiedad_id_str = str(propiedad_id)
+        current = start
+        errors = []
+        while current <= end:
+            try:
+                self.availability_table.insert_one({
+                    "propiedad_id": propiedad_id_str,
+                    "fecha": current,
+                    "disponible": False,
+                    "precio_calculado": float(precio_noche) if precio_noche is not None else None,
+                })
+            except Exception as e:
+                errors.append(f"{current.isoformat()}: {e}")
+            current += timedelta(days=1)
+
+        return {"blocked": True, "errors": errors}
+
+    def registrar_vista(self, usuario_id, propiedad_id):
+        """Inserta un evento de vista en historial_vistas usando el schema real de la tabla."""
+        try:
+            usuario_id_int = int(usuario_id)
+        except Exception as conv_err:
+            raise ValueError(f"usuario_id inválido para historial_vistas: {usuario_id}") from conv_err
+
+        if self.visits_table is None and self.db is not None:
+            try:
+                self.visits_table = self.db.get_table(self.visits_table_name)
+            except Exception:
+                self.visits_table = None
+
+        if self.visits_table is None:
+            raise RuntimeError("Tabla historial_vistas no disponible en Cassandra.")
+
+        self.visits_table.insert_one({
+            "usuario_id": usuario_id_int,
+            "propiedad_id": str(propiedad_id),
+            "timestamp": datetime.now(timezone.utc),
+            "dispositivo": "cli",
+        })
 
     def register_event(self, user_id, event_type, property_id=None, payload=None):
         if self.collection is None:

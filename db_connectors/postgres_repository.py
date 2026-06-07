@@ -568,6 +568,40 @@ class PostgresRepository:
             self.connection.rollback()
             raise
 
+    def has_overlapping_reservation(self, property_id, start_date, end_date):
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        table = self._first_existing_table(['reserva', 'reservas'])
+        if table is None:
+            return False
+
+        columns = self._table_columns(table)
+        if 'propiedad_id' not in columns:
+            return False
+
+        start_col = next((c for c in ['fecha_inicio', 'start_date', 'fecha_reserva', 'check_in'] if c in columns), None)
+        end_col = next((c for c in ['fecha_fin', 'end_date', 'check_out', 'fecha_salida'] if c in columns), None)
+        if start_col is None or end_col is None:
+            return False
+
+        where_parts = [
+            'propiedad_id = %s',
+            f'NOT ({end_col} < %s OR {start_col} > %s)',
+        ]
+        params = [property_id, start_date, end_date]
+
+        if 'estado_id' in columns:
+            where_parts.append('COALESCE(estado_id, 1) <> 3')
+        elif 'estado' in columns:
+            where_parts.append("LOWER(COALESCE(estado, '')) NOT IN ('cancelada', 'cancelado', 'cancelled')")
+        elif 'status' in columns:
+            where_parts.append("LOWER(COALESCE(status, '')) NOT IN ('cancelada', 'cancelado', 'cancelled')")
+
+        query = f"SELECT 1 FROM {table} WHERE {' AND '.join(where_parts)} LIMIT 1;"
+        self.cursor.execute(query, tuple(params))
+        return self.cursor.fetchone() is not None
+
     def create_review(self, autor_id, propiedad_id, puntaje_general, comentario=None, visible=True):
         if not self.connection or not self.cursor:
             raise RuntimeError("Conexión a Postgres no disponible.")

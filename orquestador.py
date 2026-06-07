@@ -30,7 +30,6 @@ class AirbnbOrchestrator:
         self.mongo = MongoRepository()
         self.cassandra = CassandraRepository()
         self.redis = RedisRepository()
-        # Cache TTL configurable via environment
         try:
             self.cache_ttl = int(os.getenv("CACHE_TTL_SECONDS", "300"))
         except Exception:
@@ -41,7 +40,6 @@ class AirbnbOrchestrator:
         self._print_connection_status("Astra DB", self.cassandra.collection is not None)
         self._print_connection_status("Redis", getattr(self.redis, 'client', None) is not None)
 
-        # Enforce strict roles and migrate legacy data once at startup.
         self._migrar_roles_legacy()
 
     def _auth_user_key(self, email):
@@ -954,8 +952,7 @@ el método de pago y el estado de la transacción.
         return int(propiedad_pg_id) if str(propiedad_pg_id).isdigit() else propiedad_pg_id
 
     def realizar_reserva_business(self, usuario_id, propiedad_id, inicio, fin, monto=None, metodo_pago_id=None):
-        print(f"DEBUG entrada: metodo_pago_id={metodo_pago_id}")  # agregar esta línea
-
+        cassandra_check_warning = None
         # 1) Insert reserva en Postgres (fuente de verdad)
         try:
             resolved_user_id = self._resolver_usuario_postgres(usuario_id)
@@ -965,6 +962,26 @@ el método de pago y el estado de la transacción.
             resolved_property_id = self._resolver_propiedad_postgres(propiedad_id)
             if resolved_property_id is None:
                 raise ValueError("Debe indicar una propiedad válida para la reserva.")
+
+            # 0) Verificación de disponibilidad en Cassandra antes de tocar Postgres.
+            disponibilidad_propiedad_id = str(resolved_property_id)
+            try:
+                disponible = self.cassandra.verificar_disponibilidad(disponibilidad_propiedad_id, inicio, fin)
+            except RuntimeError as cassandra_err:
+                if "Tabla disponibilidad_propiedad no disponible" in str(cassandra_err):
+                    disponible = not self.postgres.has_overlapping_reservation(
+                        resolved_property_id,
+                        inicio,
+                        fin,
+                    )
+                    cassandra_check_warning = (
+                        "Disponibilidad validada con respaldo Postgres; "
+                        "Cassandra no está disponible temporalmente."
+                    )
+                else:
+                    raise
+            if not disponible:
+                raise ValueError("Error: La propiedad no está disponible en las fechas seleccionadas")
 
             monto_calculado = self._calcular_monto_reserva(propiedad_id, inicio, fin, monto_ingresado=monto)
             pg_res = self.postgres.create_reservation(
@@ -982,12 +999,11 @@ el método de pago y el estado de la transacción.
         reserva_id = pg_res.get('id') if isinstance(pg_res, dict) else None
         tabla_reserva = pg_res.get('table') if isinstance(pg_res, dict) else 'reserva'
         warnings = []
+        if cassandra_check_warning:
+            warnings.append(cassandra_check_warning)
         precio_por_noche = self._obtener_precio_por_noche_propiedad(propiedad_id)
         disponibilidad_propiedad_id = str(resolved_property_id)
 
-
-        print(f"DEBUG pg_res: {pg_res}")
-        print(f"DEBUG reserva_id: {reserva_id}")
         # 1.b) Ajustar estados iniciales
         pago_result = None
         import psycopg2 
@@ -1006,32 +1022,36 @@ el método de pago y el estado de la transacción.
             conn2.close()
         except Exception as e:
             print(f"ERROR PAGO: {e}")
-        # 2) Marcar disponibilidad en Cassandra/Redis. Si Cassandra falla, la reserva sigue y se informa warning.
-        start = datetime.fromisoformat(inicio).date()
-        end = datetime.fromisoformat(fin).date()
-        current = start
-        while current <= end:
-            try:
-                if getattr(self.cassandra, 'availability_table', None) is not None:
-                    self.cassandra.availability_table.insert_one({
-                        'propiedad_id': disponibilidad_propiedad_id,
-                        'fecha': current,
-                        'disponible': False,
-                        'precio_calculated': precio_por_noche,
-                    })
-            except Exception as cass_err:
-                warnings.append(f"Cassandra no pudo registrar disponibilidad para {current.isoformat()}: {cass_err}")
+        # 2) Marcar disponibilidad en Cassandra por cada día del rango, y caché Redis.
+        try:
+            if getattr(self.cassandra, 'availability_table', None) is not None:
+                self.cassandra.block_dates(
+                    disponibilidad_propiedad_id,
+                    inicio,
+                    fin,
+                    precio_noche=precio_por_noche,
+                )
+            else:
+                warnings.append("Cassandra no disponible: disponibilidad no registrada.")
+        except Exception as cass_err:
+            warnings.append(f"Cassandra no pudo registrar disponibilidad: {cass_err}")
 
-            try:
-                if getattr(self.redis, 'client', None) is not None:
-                    key = f"disp:{disponibilidad_propiedad_id}:{current.isoformat()}"
-                    self.redis.set_text(key, 'false', ex=60 * 60 * 24)
-            except RedisError:
-                pass
-            except Exception:
-                pass
-
-            current += timedelta(days=1)
+        # Caché Redis por día (best-effort, no bloquea el flujo)
+        try:
+            if getattr(self.redis, 'client', None) is not None:
+                from datetime import date as _date, timedelta as _td
+                _start = datetime.fromisoformat(inicio).date()
+                _end = datetime.fromisoformat(fin).date()
+                _cur = _start
+                while _cur <= _end:
+                    try:
+                        key = f"disp:{disponibilidad_propiedad_id}:{_cur.isoformat()}"
+                        self.redis.set_text(key, 'false', ex=60 * 60 * 24)
+                    except Exception:
+                        pass
+                    _cur += timedelta(days=1)
+        except Exception:
+            pass
 
         result = {
             'postgres': pg_res,
@@ -1686,6 +1706,18 @@ el método de pago y el estado de la transacción.
                     print("No se pudo resolver el usuario para la reserva.")
                     continue
 
+                # Registrar vista en historial_vistas (Cassandra)
+                try:
+                    if getattr(self.cassandra, 'availability_table', None) is not None or getattr(self.cassandra, 'visits_table', None) is not None or getattr(self.cassandra, 'collection', None) is not None:
+                        usuario_pg_id_vista = self._resolver_usuario_postgres(usuario_email)
+                        if isinstance(usuario_pg_id_vista, int) or (isinstance(usuario_pg_id_vista, str) and usuario_pg_id_vista.isdigit()):
+                            self.cassandra.registrar_vista(
+                                usuario_id=int(usuario_pg_id_vista),
+                                propiedad_id=str(propiedad_pg_id),
+                            )
+                except Exception:
+                    pass  # No bloquear el flujo si Cassandra falla
+
                 inicio = input("Fecha inicio (YYYY-MM-DD): ").strip()
                 fin = input("Fecha fin (YYYY-MM-DD): ").strip()
 
@@ -1743,7 +1775,13 @@ el método de pago y el estado de la transacción.
                         print(f"  Estado: {postgres_info.get('mensaje', 'Pendiente')}")
                     print("=" * 50)
                 except Exception as e:
-                    print(f"Error realizando reserva: {e}")
+                    error_text = str(e)
+                    if "La propiedad no está disponible en las fechas seleccionadas" in error_text:
+                        print("Error: La propiedad no está disponible en las fechas seleccionadas")
+                    elif "No pudimos validar la disponibilidad en este momento" in error_text:
+                        print("No pudimos validar la disponibilidad en este momento. Por favor intentá nuevamente en unos minutos.")
+                    else:
+                        print(f"Error realizando reserva: {e}")
             elif accion == "cancelar_mi_reserva":
                 print("\n--- Cancelar mi reserva (Postgres) ---")
                 usuario_sesion = self._resolver_usuario_postgres(active_session.get('email') if active_session else None)

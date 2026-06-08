@@ -166,7 +166,6 @@ class CassandraRepository:
         errors = []
         while current <= end:
             try:
-                print(f"Insertando fecha {current.isoformat()} para propiedad {propiedad_id_str}")
                 self._table_insert_one(self.availability_table_name, {
                     "propiedad_id": propiedad_id_str,
                     "fecha": current.isoformat(),
@@ -189,12 +188,16 @@ class CassandraRepository:
         if self.visits_table is None:
             raise RuntimeError("Tabla historial_vistas no disponible en Cassandra.")
 
-        self._table_insert_one(self.visits_table_name, {
-            "usuario_id": usuario_id_int,
-            "propiedad_id": str(propiedad_id),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "dispositivo": "cli",
-        })
+        try:
+            self._table_insert_one(self.visits_table_name, {
+                "usuario_id": usuario_id_int,
+                "propiedad_id": str(propiedad_id),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "dispositivo": "cli",
+            })
+        except Exception as e:
+            print(f"Error en Cassandra vistas: {e}")
+            raise
 
     def register_event(self, user_id, event_type, property_id=None, payload=None):
         if self.collection is None:

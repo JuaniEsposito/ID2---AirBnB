@@ -443,19 +443,14 @@ class AirbnbOrchestrator:
 CASOS DE USO IMPLEMENTADOS
 ================================================================================
 1. ¿Cuántas reservas se realizan en una ciudad específica en el último mes? (Postgres)
-3. Tipos de alojamiento populares (MongoDB)
-4. Propiedades agregadas recientemente (MongoDB)
-5. Mejores anfitriones (MongoDB)
-6. Áreas más demandadas por país (MongoDB)
+2. Tipos de alojamiento populares (MongoDB)
+3. Propiedades agregadas recientemente (MongoDB)
+4. Mejores anfitriones (MongoDB)
+5. Barrios más demandados por país (Postgres)
+6. ¿Cuántas propiedades tienen una calificación mayor a 4.5 y están ubicadas en el centro de la ciudad? (MongoDB)
 7. Propiedades con +20 reseñas O en zona turística (MongoDB)
-8. Propiedades en todo el catálogo con rating alto (MongoDB)
-9. Disponibilidad de propiedad en rango de fechas (Cassandra + Redis)
-10. Propiedades por tipo y calificación (MongoDB)
-11. Resumen de reseñas por propiedad (MongoDB)
-12. Reseñas recientes visibles (MongoDB)
-13. Pagos y transacciones (Postgres)
-14. Servicios Backend (Redis / Cassandra)
-15. Cerrar sesión y salir del sistema
+8. Disponibilidad de propiedad en rango de fechas (Cassandra + Redis)
+0. Volver
 
 Notas:
 - Los casos de uso están distribuidos según el patrón de acceso.
@@ -505,11 +500,10 @@ el método de pago y el estado de la transacción.
             print("2. Tipos de alojamiento populares (MongoDB)")
             print("3. Propiedades agregadas recientemente (MongoDB)")
             print("4. Mejores anfitriones (MongoDB)")
-            print("5. Áreas más demandadas por país (MongoDB)")
+            print("5. Barrios más demandados por país (Postgres)")
             print("6. ¿Cuántas propiedades tienen una calificación mayor a 4.5 y están ubicadas en el centro de la ciudad? (MongoDB)")
             print("7. Propiedades con +20 reseñas O en zona turística (MongoDB)")
             print("8. Disponibilidad de propiedad en rango de fechas (Cassandra + Redis)")
-            print("9. Servicios Backend (Redis / Cassandra)")
             print("0. Volver")
 
             opc_raw = input("\nSeleccione una opción: ").strip()
@@ -527,7 +521,7 @@ el método de pago y el estado de la transacción.
             elif opc == "3":
                 dias = input("Ingrese la cantidad de días para buscar propiedades recientes (ej: 30): ").strip() or "30"
                 print(self.propiedades_recientes(dias=dias))
-            elif opc == "3":
+            elif opc == "4":
                 limite = input("Ingrese cuántos anfitriones mostrar (ej: 5): ").strip() or "5"
                 print(self.mejores_anfitriones(limite=int(limite)))
             elif opc == "5":
@@ -552,8 +546,6 @@ el método de pago y el estado de la transacción.
                 resultado = self.disponibilidad_propiedad_rango(propiedad_id, fecha_inicio, fecha_fin)
                 print("\n> Resultado de disponibilidad:")
                 print(resultado)
-            elif opc == "9":
-                self.menu_backends()
             else:
                 print("\n⚠ Opción no válida. Intente nuevamente.")
 
@@ -1698,10 +1690,13 @@ el método de pago y el estado de la transacción.
                 if seleccion_valida is None:
                     continue
 
-                propiedad_pg_id = seleccion_valida.get("propiedad_pg_id")
-                if propiedad_pg_id is None:
+                propiedad_real_id = seleccion_valida.get("propiedad_pg_id")
+                if propiedad_real_id is None:
                     print("Esta propiedad no está disponible para reservar")
                     continue
+
+                # Asegurar siempre el ID real de la propiedad en Postgres (nunca el número de opción del menú).
+                propiedad_real_id = int(propiedad_real_id) if str(propiedad_real_id).isdigit() else propiedad_real_id
 
                 usuario_email = (active_session.get('email') if active_session else None)
                 if not usuario_email:
@@ -1717,7 +1712,7 @@ el método de pago y el estado de la transacción.
                         if isinstance(usuario_pg_id_vista, int) or (isinstance(usuario_pg_id_vista, str) and usuario_pg_id_vista.isdigit()):
                             self.cassandra.registrar_vista(
                                 usuario_id=int(usuario_pg_id_vista),
-                                propiedad_id=str(propiedad_pg_id),
+                                propiedad_id=str(propiedad_real_id),
                             )
                 except Exception:
                     pass  # No bloquear el flujo si Cassandra falla
@@ -1758,7 +1753,7 @@ el método de pago y el estado de la transacción.
                 try:
                     res = self.realizar_reserva_business(
                         usuario_email,
-                        propiedad_pg_id,
+                        propiedad_real_id,
                         inicio,
                         fin,
                         metodo_pago_id=metodo_id,
@@ -1797,15 +1792,60 @@ el método de pago y el estado de la transacción.
                     print("No se pudo resolver el usuario de sesión en Postgres.")
                     continue
 
-                self._mostrar_reservas_menu(
-                    solo_pendientes=False,
-                    usuario_id=usuario_sesion,
-                    titulo_personalizado="Mis reservas no canceladas:",
-                )
-                reserva_id = input("Reserva ID a cancelar: ").strip()
-                if not reserva_id:
-                    print("Error: debe ingresar una reserva_id válida.")
+                try:
+                    self.postgres.cursor.execute(
+                        """
+                        SELECT
+                            r.id,
+                            COALESCE(NULLIF(TRIM(p.titulo), ''), 'Propiedad sin título') AS titulo_propiedad,
+                            r.fecha_inicio,
+                            r.fecha_fin,
+                            r.monto_total
+                        FROM reserva r
+                        LEFT JOIN propiedad p ON p.id = r.propiedad_id
+                        WHERE r.estado_id <> 3
+                          AND r.usuario_id = %s
+                        ORDER BY r.id DESC
+                        """,
+                        (int(usuario_sesion),),
+                    )
+                    reservas_usuario = self.postgres.cursor.fetchall() or []
+                except Exception as e:
+                    try:
+                        if getattr(self.postgres, 'connection', None) is not None:
+                            self.postgres.connection.rollback()
+                    except Exception:
+                        pass
+                    print(f"No se pudieron listar reservas: {e}")
                     continue
+
+                print("\nMis reservas no canceladas:")
+                print("N° | Título propiedad                  | Fecha inicio | Fecha fin  | Monto")
+                print("--------------------------------------------------------------------------")
+                if not reservas_usuario:
+                    print("(sin resultados)")
+                    continue
+
+                for idx, row in enumerate(reservas_usuario, start=1):
+                    _, titulo_propiedad, fecha_inicio, fecha_fin, monto = row
+                    fecha_inicio_texto = fecha_inicio.isoformat() if hasattr(fecha_inicio, 'isoformat') else str(fecha_inicio)
+                    fecha_fin_texto = fecha_fin.isoformat() if hasattr(fecha_fin, 'isoformat') else str(fecha_fin)
+                    titulo_texto = str(titulo_propiedad or "Propiedad sin título")[:32]
+                    print(f"{idx:<2} | {titulo_texto:<32} | {fecha_inicio_texto:<11} | {fecha_fin_texto:<10} | {monto}")
+
+                seleccion_reserva = input("Seleccione el número de reserva a cancelar (0 para volver): ").strip()
+                if not seleccion_reserva or seleccion_reserva == "0":
+                    continue
+                if not seleccion_reserva.isdigit():
+                    print("Error: debe ingresar un número válido.")
+                    continue
+
+                indice_reserva = int(seleccion_reserva)
+                if indice_reserva < 1 or indice_reserva > len(reservas_usuario):
+                    print("Error: número fuera de rango.")
+                    continue
+
+                reserva_id = reservas_usuario[indice_reserva - 1][0]
 
                 try:
                     res = self.cancelar_reserva(int(reserva_id), usuario_id=usuario_sesion)
@@ -1813,7 +1853,6 @@ el método de pago y el estado de la transacción.
                         print("\n" + "=" * 50)
                         print("✓ ¡Reserva cancelada exitosamente!")
                         print("=" * 50)
-                        print(f"  Reserva ID: {reserva_id}")
                         print(f"  Reservas actualizadas: {res.get('reservas_actualizadas', 0)}")
                         print(f"  Pagos actualizados: {res.get('pagos_actualizados', 0)}")
                         print("=" * 50)
@@ -2268,12 +2307,10 @@ el método de pago y el estado de la transacción.
         return "\n".join(bloques)
 
     def _formatear_areas(self, areas, pais):
-        bloques = [f"\nÁREAS MÁS DEMANDADAS EN {pais.upper()}", "=" * 72]
+        bloques = [f"\nBARRIOS MÁS DEMANDADOS EN {pais.upper()}", "=" * 72]
         for indice, area in enumerate(areas, start=1):
-            ciudad = area.get("ciudad", "N/D")
-            provincia = area.get("provincia", "")
-            ubicacion_texto = ciudad if not provincia or provincia == "N/D" else f"{ciudad} - {provincia}"
-            bloques.append(f"{indice}. {ubicacion_texto} | {area.get('total', 0)} reservas")
+            barrio = area.get("barrio") or area.get("ciudad") or "N/D"
+            bloques.append(f"{indice}. {barrio} | {area.get('total', 0)} reservas")
             bloques.append("-" * 72)
         return "\n".join(bloques)
 

@@ -1277,24 +1277,37 @@ class PostgresRepository:
             raise RuntimeError("Conexión a Postgres no disponible.")
 
         try:
-            self.cursor.execute(
-                """
+            ubicacion_cols = self._table_columns("ubicacion")
+            propiedad_table = self._first_existing_table(["propiedad", "propiedades"])
+            propiedad_cols = self._table_columns(propiedad_table) if propiedad_table else set()
+
+            join_propiedad = ""
+            if "barrio" in ubicacion_cols:
+                area_expr = "COALESCE(NULLIF(TRIM(u.barrio), ''), 'N/D')"
+            elif propiedad_table and "barrio" in propiedad_cols:
+                join_propiedad = f" INNER JOIN {propiedad_table} p ON p.id = r.propiedad_id"
+                area_expr = "COALESCE(NULLIF(TRIM(p.barrio), ''), 'N/D')"
+            else:
+                # Fallback técnico para no romper si el schema aún no tiene barrio persistido.
+                area_expr = "COALESCE(NULLIF(TRIM(u.ciudad), ''), 'N/D')"
+
+            query = f"""
                 SELECT
-                    COALESCE(u.ciudad, 'N/D') AS ciudad,
-                    COALESCE(u.provincia, 'N/D') AS provincia,
+                    {area_expr} AS barrio,
                     COUNT(*) AS total
                 FROM reserva r
                 INNER JOIN ubicacion u ON u.propiedad_id = r.propiedad_id
-                WHERE u.pais = %s
-                GROUP BY COALESCE(u.ciudad, 'N/D'), COALESCE(u.provincia, 'N/D')
-                ORDER BY total DESC, ciudad ASC
+                {join_propiedad}
+                WHERE TRIM(LOWER(COALESCE(u.pais, ''))) = TRIM(LOWER(%s))
+                GROUP BY {area_expr}
+                ORDER BY total DESC, barrio ASC
                 LIMIT %s;
-                """,
-                (country, int(limit)),
-            )
+            """
+
+            self.cursor.execute(query, (country, int(limit)))
             rows = self.cursor.fetchall() or []
             return [
-                {"ciudad": row[0], "provincia": row[1], "total": int(row[2])}
+                {"barrio": row[0], "total": int(row[1])}
                 for row in rows
             ]
         except Exception:

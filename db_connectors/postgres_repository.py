@@ -329,6 +329,107 @@ class PostgresRepository:
         self.cursor.execute(query, tuple(vals))
         return self.cursor.fetchone()[0] if "id" in columns else None
 
+    def asegurar_ubicacion(self, ciudad, pais, propiedad_id=None, property_doc=None):
+        """Garantiza que exista al menos un registro de ubicación para ciudad/pais en Postgres."""
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        table = self._first_existing_table(["ubicacion"])
+        if table is None:
+            raise RuntimeError("No se encontró la tabla ubicacion en Postgres.")
+
+        ciudad_norm = (ciudad or "").strip()
+        pais_norm = (pais or "").strip()
+        if not ciudad_norm or not pais_norm:
+            raise ValueError("Ciudad y país son obligatorios para asegurar ubicación.")
+
+        columns = self._table_columns(table)
+        if "ciudad" not in columns or "pais" not in columns:
+            raise RuntimeError("La tabla ubicacion no contiene columnas ciudad/pais.")
+
+        try:
+            if "id" in columns:
+                self.cursor.execute(
+                    f"""
+                    SELECT id
+                    FROM {table}
+                    WHERE LOWER(TRIM(ciudad)) = LOWER(TRIM(%s))
+                      AND LOWER(TRIM(pais)) = LOWER(TRIM(%s))
+                    LIMIT 1;
+                    """,
+                    (ciudad_norm, pais_norm),
+                )
+                existing = self.cursor.fetchone()
+                if existing:
+                    return {"created": False, "id": existing[0], "table": table, "ciudad": ciudad_norm, "pais": pais_norm}
+            else:
+                self.cursor.execute(
+                    f"""
+                    SELECT 1
+                    FROM {table}
+                    WHERE LOWER(TRIM(ciudad)) = LOWER(TRIM(%s))
+                      AND LOWER(TRIM(pais)) = LOWER(TRIM(%s))
+                    LIMIT 1;
+                    """,
+                    (ciudad_norm, pais_norm),
+                )
+                if self.cursor.fetchone():
+                    return {"created": False, "id": None, "table": table, "ciudad": ciudad_norm, "pais": pais_norm}
+
+            ubicacion = (property_doc or {}).get("ubicacion") if isinstance((property_doc or {}).get("ubicacion"), dict) else {}
+            coordinates = ubicacion.get("coordenadas") if isinstance(ubicacion.get("coordenadas"), dict) else {}
+            coords = coordinates.get("coordinates") if isinstance(coordinates.get("coordinates"), list) else []
+
+            candidate_values = {
+                "ciudad": ciudad_norm,
+                "pais": pais_norm,
+                "propiedad_id": propiedad_id,
+                "provincia": ubicacion.get("provincia"),
+                "calle": ubicacion.get("calle"),
+                "numero": ubicacion.get("numero"),
+                "codigo_postal": ubicacion.get("codigo_postal"),
+                "latitud": ubicacion.get("latitud") if ubicacion.get("latitud") is not None else (coords[1] if len(coords) >= 2 else None),
+                "longitud": ubicacion.get("longitud") if ubicacion.get("longitud") is not None else (coords[0] if len(coords) >= 2 else None),
+            }
+
+            insert_columns = []
+            insert_values = []
+            for column_name, value in candidate_values.items():
+                if column_name not in columns or value is None:
+                    continue
+                insert_columns.append(column_name)
+                insert_values.append(value)
+
+            # Si propiedad_id existe y es NOT NULL, se vuelve obligatorio al insertar.
+            if "propiedad_id" in columns and propiedad_id is None:
+                metadata = self._column_metadata(table, "propiedad_id")
+                if metadata and not metadata.get("is_nullable"):
+                    raise RuntimeError("ubicacion.propiedad_id es obligatorio y no se recibió un propiedad_id válido.")
+
+            if not insert_columns:
+                raise RuntimeError("No se encontraron columnas válidas para insertar ubicación en Postgres.")
+
+            placeholders = ", ".join(["%s"] * len(insert_values))
+            returning = " RETURNING id" if "id" in columns else ""
+            query = f"INSERT INTO {table} ({', '.join(insert_columns)}) VALUES ({placeholders}){returning};"
+
+            if "id" in columns:
+                try:
+                    self._sync_identity_sequence(table)
+                except Exception:
+                    pass
+
+            self.cursor.execute(query, tuple(insert_values))
+            inserted_id = self.cursor.fetchone()[0] if "id" in columns else None
+            self.connection.commit()
+            return {"created": True, "id": inserted_id, "table": table, "ciudad": ciudad_norm, "pais": pais_norm}
+        except Psycopg2Error:
+            self.connection.rollback()
+            raise
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def _split_full_name(self, full_name):
         parts = [part for part in (full_name or "").strip().split() if part]
         if not parts:
@@ -1116,35 +1217,14 @@ class PostgresRepository:
         if not self.connection or not self.cursor:
             raise RuntimeError("Conexión a Postgres no disponible.")
 
-        # Prefer reservation/check-in dates over creation timestamps for this KPI.
-        date_columns = ["fecha_inicio", "check_in", "fecha_reserva", "fecha", "created_at", "fecha_creacion"]
-        available_date_column = None
-
-        for column_name in date_columns:
-            self.cursor.execute(
-                """
-                SELECT 1
-                FROM information_schema.columns
-                WHERE table_name = 'reserva' AND column_name = %s
-                LIMIT 1;
-                """,
-                (column_name,),
-            )
-            if self.cursor.fetchone():
-                available_date_column = column_name
-                break
-
-        if available_date_column is None:
-            raise RuntimeError("No se encontró una columna de fecha compatible en la tabla reservas.")
-
         try:
-            query = f"""
-                SELECT count(*)
+            query = """
+                SELECT count(r.id)
                 FROM reserva r
-                INNER JOIN ubicacion u ON u.propiedad_id = r.propiedad_id
-                                WHERE TRIM(COALESCE(u.ciudad, '')) ILIKE TRIM(%s)
-                                    AND r.{available_date_column} IS NOT NULL
-                                    AND r.{available_date_column} >= CURRENT_DATE - INTERVAL '1 month';
+                JOIN propiedad p ON r.propiedad_id = p.id
+                JOIN ubicacion u ON p.id = u.propiedad_id
+                WHERE TRIM(LOWER(u.ciudad)) = TRIM(LOWER(%s))
+                AND r.fecha_creacion >= CURRENT_DATE - INTERVAL '1 month';
             """
             self.cursor.execute(query, (city,))
             row = self.cursor.fetchone()

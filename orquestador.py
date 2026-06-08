@@ -442,7 +442,7 @@ class AirbnbOrchestrator:
         return """
 CASOS DE USO IMPLEMENTADOS
 ================================================================================
-1. ¿Cuántas reservas se realizan en una ciudad específica en el último mes? (Postgres + Redis)
+1. ¿Cuántas reservas se realizan en una ciudad específica en el último mes? (Postgres)
 3. Tipos de alojamiento populares (MongoDB)
 4. Propiedades agregadas recientemente (MongoDB)
 5. Mejores anfitriones (MongoDB)
@@ -501,7 +501,7 @@ el método de pago y el estado de la transacción.
             print("\n" + "=" * 30)
             print("=== CASOS DE USO ===")
             print("=" * 30)
-            print("1. ¿Cuántas reservas se realizan en una ciudad específica en el último mes? (Postgres + Redis)")
+            print("1. ¿Cuántas reservas se realizan en una ciudad específica en el último mes? (Postgres)")
             print("2. Tipos de alojamiento populares (MongoDB)")
             print("3. Propiedades agregadas recientemente (MongoDB)")
             print("4. Mejores anfitriones (MongoDB)")
@@ -731,11 +731,20 @@ el método de pago y el estado de la transacción.
             if propiedad_pg_id is None:
                 raise RuntimeError("Postgres no devolvió el ID de la propiedad maestra.")
 
-            # 2) Postgres: alta en ubicacion con el id de propiedad generado.
-            # publicar_propiedad_maestro puede devolver ubicacion_id si ya la insertó.
-            ubicacion_insert_id = postgres_res.get("ubicacion_id") if isinstance(postgres_res, dict) else None
-            if ubicacion_insert_id is None:
-                ubicacion_insert_id = self.postgres._insert_ubicacion(propiedad_pg_id, property_doc)
+            # 2) Postgres: asegurar ubicación ciudad/país antes de Mongo.
+            # Si falla aquí, se aborta y no se continúa con inserción en Mongo.
+            ubicacion_doc = property_doc.get("ubicacion") if isinstance(property_doc.get("ubicacion"), dict) else {}
+            ciudad = (ubicacion_doc.get("ciudad") or "").strip()
+            pais = (ubicacion_doc.get("pais") or "").strip()
+            ubicacion_res = self.postgres.asegurar_ubicacion(
+                ciudad,
+                pais,
+                propiedad_id=propiedad_pg_id,
+                property_doc=property_doc,
+            )
+            ubicacion_insert_id = ubicacion_res.get("id") if isinstance(ubicacion_res, dict) else None
+            if isinstance(ubicacion_res, dict) and ubicacion_res.get("created"):
+                print(f"[Postgres] Nueva ubicación creada automáticamente: {ciudad}, {pais}")
 
             # Campos exclusivos de MongoDB (no persistidos en Postgres).
             def _norm_text(value):
@@ -784,7 +793,6 @@ el método de pago y el estado de la transacción.
                 ]
             }
 
-            ubicacion_doc = property_doc.get("ubicacion") if isinstance(property_doc.get("ubicacion"), dict) else {}
             ciudad = ubicacion_doc.get("ciudad")
             barrio = property_doc.get("barrio") or ubicacion_doc.get("barrio")
 

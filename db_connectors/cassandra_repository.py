@@ -19,6 +19,24 @@ class CassandraRepository:
         self.visits_table = None
         self.connect()
 
+    def _table_command(self, table_name, body):
+        if self.db is None:
+            raise RuntimeError("Cassandra no conectado.")
+        return self.db.command(body, collection_name=table_name)
+
+    def _table_find(self, table_name, filter_doc):
+        response = self._table_command(table_name, {"find": {"filter": filter_doc}})
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        return data.get("documents", []) or []
+
+    def _table_find_one(self, table_name, filter_doc):
+        response = self._table_command(table_name, {"findOne": {"filter": filter_doc}})
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        return data.get("document")
+
+    def _table_insert_one(self, table_name, row):
+        return self._table_command(table_name, {"insertOne": {"document": row}})
+
     def connect(self):
         if not self.token or not self.endpoint:
             return False
@@ -32,14 +50,20 @@ class CassandraRepository:
                 self.collection = self.db.create_collection(self.collection_name)
 
             try:
-                self.availability_table = self.db.get_table(self.availability_table_name)
-            except Exception:
+                self._table_find_one(
+                    self.availability_table_name,
+                    {"propiedad_id": "__healthcheck__", "fecha": "1900-01-01"},
+                )
+                self.availability_table = self.availability_table_name
+            except Exception as availability_err:
                 self.availability_table = None
+                print(f"✗ Error tabla Astra '{self.availability_table_name}': {availability_err}")
 
             try:
-                self.visits_table = self.db.get_table(self.visits_table_name)
-            except Exception:
+                self.visits_table = self.visits_table_name
+            except Exception as visits_err:
                 self.visits_table = None
+                print(f"✗ Error tabla Astra '{self.visits_table_name}': {visits_err}")
             return True
         except Exception as conn_err:
             self.client = None
@@ -80,16 +104,13 @@ class CassandraRepository:
 
         expected_days = (end - start).days + 1
 
-        query = {
-            "propiedad_id": property_id,
-            "fecha": {"$gte": start, "$lte": end},
-        }
-        rows = list(self.availability_table.find(query))
+        rows = self._table_find(self.availability_table_name, {"propiedad_id": str(property_id)})
 
         available_by_day = {}
         for row in rows:
             row_date = self._parse_date(row.get("fecha"))
-            available_by_day[row_date] = bool(row.get("disponible"))
+            if start <= row_date <= end:
+                available_by_day[row_date] = bool(row.get("disponible"))
 
         missing_days = []
         unavailable_days = []
@@ -122,17 +143,11 @@ class CassandraRepository:
         if start > end:
             raise ValueError("La fecha de inicio no puede ser mayor que la fecha de fin.")
 
-        rows = list(
-            self.availability_table.find(
-                {
-                    "propiedad_id": str(propiedad_id),
-                    "fecha": {"$gte": start, "$lte": end},
-                }
-            )
-        )
+        rows = self._table_find(self.availability_table_name, {"propiedad_id": str(propiedad_id)})
 
         for row in rows:
-            if row.get("disponible") is False:
+            row_date = self._parse_date(row.get("fecha"))
+            if start <= row_date <= end and row.get("disponible") is False:
                 return False
         return True
 
@@ -151,11 +166,12 @@ class CassandraRepository:
         errors = []
         while current <= end:
             try:
-                self.availability_table.insert_one({
+                print(f"Insertando fecha {current.isoformat()} para propiedad {propiedad_id_str}")
+                self._table_insert_one(self.availability_table_name, {
                     "propiedad_id": propiedad_id_str,
-                    "fecha": current,
+                    "fecha": current.isoformat(),
                     "disponible": False,
-                    "precio_calculado": float(precio_noche) if precio_noche is not None else None,
+                    "precio_calculated": float(precio_noche) if precio_noche is not None else None,
                 })
             except Exception as e:
                 errors.append(f"{current.isoformat()}: {e}")
@@ -170,19 +186,13 @@ class CassandraRepository:
         except Exception as conv_err:
             raise ValueError(f"usuario_id inválido para historial_vistas: {usuario_id}") from conv_err
 
-        if self.visits_table is None and self.db is not None:
-            try:
-                self.visits_table = self.db.get_table(self.visits_table_name)
-            except Exception:
-                self.visits_table = None
-
         if self.visits_table is None:
             raise RuntimeError("Tabla historial_vistas no disponible en Cassandra.")
 
-        self.visits_table.insert_one({
+        self._table_insert_one(self.visits_table_name, {
             "usuario_id": usuario_id_int,
             "propiedad_id": str(propiedad_id),
-            "timestamp": datetime.now(timezone.utc),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "dispositivo": "cli",
         })
 

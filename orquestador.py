@@ -967,19 +967,12 @@ el método de pago y el estado de la transacción.
             disponibilidad_propiedad_id = str(resolved_property_id)
             try:
                 disponible = self.cassandra.verificar_disponibilidad(disponibilidad_propiedad_id, inicio, fin)
-            except RuntimeError as cassandra_err:
-                if "Tabla disponibilidad_propiedad no disponible" in str(cassandra_err):
-                    disponible = not self.postgres.has_overlapping_reservation(
-                        resolved_property_id,
-                        inicio,
-                        fin,
-                    )
-                    cassandra_check_warning = (
-                        "Disponibilidad validada con respaldo Postgres; "
-                        "Cassandra no está disponible temporalmente."
-                    )
-                else:
-                    raise
+            except Exception as cassandra_err:
+                print(f"Error Cassandra en verificación de disponibilidad: {cassandra_err}")
+                raise ValueError(
+                    "Error: No se pudo validar la disponibilidad en este momento. "
+                    "Intente nuevamente en unos minutos."
+                ) from cassandra_err
             if not disponible:
                 raise ValueError("Error: La propiedad no está disponible en las fechas seleccionadas")
 
@@ -1032,9 +1025,9 @@ el método de pago y el estado de la transacción.
                     precio_noche=precio_por_noche,
                 )
             else:
-                warnings.append("Cassandra no disponible: disponibilidad no registrada.")
+                warnings.append("No se pudo registrar la disponibilidad en Cassandra.")
         except Exception as cass_err:
-            warnings.append(f"Cassandra no pudo registrar disponibilidad: {cass_err}")
+            warnings.append("No se pudo registrar la disponibilidad en Cassandra.")
 
         # Caché Redis por día (best-effort, no bloquea el flujo)
         try:
@@ -1520,7 +1513,10 @@ el método de pago y el estado de la transacción.
 
             if accion == "publicar_propiedad":
                 print("\n--- Publicar propiedad (MongoDB) ---")
-                anfitrion = input("Anfitrión ID: ").strip() or (active_session.get('email') if active_session else None)
+                anfitrion = active_session.get('email') if active_session else None
+                if not anfitrion:
+                    print("No se pudo identificar al anfitrión de la sesión activa.")
+                    continue
                 titulo = input("Título: ").strip()
                 descripcion = input("Descripción: ").strip()
                 tipo_propiedad = self._seleccionar_tipo_propiedad_cli()
@@ -1769,15 +1765,19 @@ el método de pago y el estado de la transacción.
                         pago_info = res.get('pago', {}) if isinstance(res, dict) else {}
                         if isinstance(pago_info, dict) and pago_info.get('created'):
                             print("  Pago inicial: Pendiente")
-                        if postgres_info.get('id'):
-                            print(f"  ID Reserva: {postgres_info.get('id')}")
+                        print(f"  Check-in: {inicio}")
+                        print(f"  Check-out: {fin}")
                     else:
                         print(f"  Estado: {postgres_info.get('mensaje', 'Pendiente')}")
+                    if isinstance(res, dict) and res.get('warning'):
+                        print(f"  Aviso: {res.get('warning')}")
                     print("=" * 50)
                 except Exception as e:
                     error_text = str(e)
                     if "La propiedad no está disponible en las fechas seleccionadas" in error_text:
                         print("Error: La propiedad no está disponible en las fechas seleccionadas")
+                    elif "No se pudo validar la disponibilidad en este momento" in error_text:
+                        print("Error: No se pudo validar la disponibilidad en este momento. Intente nuevamente en unos minutos.")
                     elif "No pudimos validar la disponibilidad en este momento" in error_text:
                         print("No pudimos validar la disponibilidad en este momento. Por favor intentá nuevamente en unos minutos.")
                     else:

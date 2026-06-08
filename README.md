@@ -6,19 +6,14 @@ CLI para el proyecto Airbnb poliglota con persistencia en múltiples bases de da
 
 | Caso de uso | Base de datos | Dónde está implementado (módulo / función) | CLI |
 |---|---:|---|---|
-| Reservas en una ciudad (total) | Postgres | `db_connectors/postgres_repository.py` → `count_reservations_by_city` | Opción 1
-| Reservas en la ciudad último mes | Postgres (+ Redis cache) | `db_connectors/postgres_repository.py` → `count_reservations_by_city_last_month` (cache en `db_connectors/redis_repository.py`) | Opción 2
-| Tipos de alojamiento más populares | MongoDB | `db_connectors/mongo_repository.py` → `popular_accommodations` | Opción 3
-| Propiedades agregadas recientemente | MongoDB | `db_connectors/mongo_repository.py` → `recent_properties` | Opción 4
-| Mejores anfitriones por calificación | MongoDB (+ Redis opcional) | `db_connectors/mongo_repository.py` → `top_hosts_by_rating` | Opción 5
-| Áreas más demandadas por país | MongoDB + agregación | `db_connectors/mongo_repository.py` → `most_demanded_areas_by_country` | Opción 6
-| Propiedades con >20 reseñas O en zona turística | MongoDB | `db_connectors/mongo_repository.py` → `properties_with_many_reviews_or_touristic_zone` | Opción 7
-| Propiedades con rating alto (todo el catálogo) | MongoDB | `db_connectors/mongo_repository.py` → `properties_with_high_rating_anywhere` | Opción 7a
-| Búsqueda por ciudad / centro con rating alto | MongoDB | `db_connectors/mongo_repository.py` → `properties_with_high_rating_in_center(min_rating, ciudad=None)` | (función disponible; usar API directa o agregar opción personalizada)
-| Resumen de reseñas por propiedad | MongoDB | `db_connectors/mongo_repository.py` → `property_review_summary` | Opción 10
-| Reseñas recientes visibles | MongoDB | `db_connectors/mongo_repository.py` → `recent_visible_reviews` | Opción 11
-| Resumen de pagos y transacciones | Postgres | `db_connectors/postgres_repository.py` → `payment_summary_last_month` | Opción 12
-| Telemetría / eventos por usuario | Cassandra | `db_connectors/cassandra_repository.py` → `register_event` / `get_user_events` | Opción 13 (submenú)
+| ¿Cuántas reservas se realizan en una ciudad específica en el último mes? | Postgres (+ Redis cache) | `orquestador.py` → `contar_reservas_ciudad_ultimo_mes` / `db_connectors/postgres_repository.py` → `count_reservations_by_city_last_month` | Opción 1
+| Tipos de alojamiento más populares | MongoDB (+ Redis cache) | `orquestador.py` → `alojamiento_mas_popular` / `db_connectors/mongo_repository.py` → `popular_accommodations` | Opción 2
+| Propiedades agregadas recientemente | MongoDB | `orquestador.py` → `propiedades_recientes` / `db_connectors/mongo_repository.py` → `recent_properties` | Opción 3
+| Mejores anfitriones | Postgres (principal) + MongoDB/Redis (fallback) | `orquestador.py` → `mejores_anfitriones` / `db_connectors/postgres_repository.py` → `top_hosts_by_reviews` | Opción 4
+| Barrios más demandados por país | Postgres | `orquestador.py` → `areas_mas_demandadas_pais` / `db_connectors/postgres_repository.py` → `most_demanded_areas_by_country` | Opción 5
+| Propiedades con calificación mayor a 4.5 en CABA | MongoDB | `db_connectors/mongo_repository.py` → `properties_with_high_rating_in_center(min_rating, ciudad)` | Opción 6
+| Propiedades con +20 reseñas o en zona turística | MongoDB | `orquestador.py` → `propiedades_mas_resenadas_o_zona_turistica` / `db_connectors/mongo_repository.py` → `properties_with_many_reviews_or_touristic_zone` | Opción 7
+| Disponibilidad de propiedad en rango de fechas | Cassandra + Redis | `orquestador.py` → `disponibilidad_propiedad_rango` / `db_connectors/cassandra_repository.py` → `check_property_availability` | Opción 8
 
 
 ## Cómo ejecutar

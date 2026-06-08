@@ -51,6 +51,12 @@ class AirbnbOrchestrator:
     def _auth_session_index_key(self, email):
         return f"auth:session_index:{(email or '').strip().casefold()}"
 
+    def _session_index_key(self):
+        return "sessionindex"
+
+    def _active_user_key(self):
+        return "user"
+
     def _normalize_email(self, email):
         return (email or "").strip().casefold()
 
@@ -67,7 +73,7 @@ class AirbnbOrchestrator:
         return self._hash_password(password, salt=salt) == stored_value
 
     def _session_ttl(self, trusted_device):
-        return 60 * 60 * 24 * 7 if trusted_device else 60 * 30
+        return 60 * 60 * 24
 
     def _normalizar_tipo_propiedad(self, tipo_propiedad, titulo=None):
         tipo = (tipo_propiedad or "").strip()
@@ -294,6 +300,13 @@ class AirbnbOrchestrator:
 
         self.redis.set_json(self._auth_session_key(session_token), session_doc, ex=session_ttl)
         self.redis.set_json(self._auth_session_index_key(email_normalizado), {"session_token": session_token}, ex=session_ttl)
+        self.redis.set_json(self._session_index_key(), {"email": email_normalizado, "session_token": session_token}, ex=session_ttl)
+        self.redis.set_json(self._active_user_key(), {
+            "email": email_normalizado,
+            "nombre_completo": user_doc.get("nombre_completo", "Usuario"),
+            "tipo": self._normalizar_tipo_usuario(user_doc.get("tipo", "huesped")),
+            "last_login_at": session_doc["login_at"],
+        }, ex=session_ttl)
 
         user_doc["last_login_at"] = session_doc["login_at"]
         user_doc["trusted_device"] = bool(trusted_device)
@@ -332,6 +345,10 @@ class AirbnbOrchestrator:
         if not token:
             session_index = self._redis_get_json(self._auth_session_index_key(email_normalizado)) or {}
             token = session_index.get("session_token", "")
+        if not token:
+            session_index_global = self._redis_get_json(self._session_index_key()) or {}
+            if self._normalize_email(session_index_global.get("email")) == email_normalizado:
+                token = session_index_global.get("session_token", "")
 
         if token:
             try:
@@ -343,6 +360,18 @@ class AirbnbOrchestrator:
         try:
             if getattr(self.redis, 'client', None) is not None:
                 self.redis.client.delete(self._auth_session_index_key(email_normalizado))
+        except Exception:
+            pass
+
+        try:
+            if getattr(self.redis, 'client', None) is not None:
+                self.redis.client.delete(self._session_index_key())
+        except Exception:
+            pass
+
+        try:
+            if getattr(self.redis, 'client', None) is not None:
+                self.redis.client.delete(self._active_user_key())
         except Exception:
             pass
 
@@ -373,15 +402,16 @@ class AirbnbOrchestrator:
             return f"Error al consultar disponibilidad: {e}"
 
     def registrar_login_evento(self, email, trusted_device):
-        session_key = f"auth:login_events:{self._normalize_email(email)}"
-        eventos = self._redis_get_json(session_key) or []
-        eventos.append({
+        event_payload = {
             "email": self._normalize_email(email),
             "trusted_device": bool(trusted_device),
             "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-        self._redis_set_json(session_key, eventos, ttl_seconds=60 * 60 * 24 * 30)
-        return eventos
+        }
+
+        if getattr(self.redis, 'client', None) is not None:
+            self.redis.lpush_json("loginevents", event_payload, max_len=2000)
+
+        return event_payload
 
     # Redis connection handled by RedisRepository
 
@@ -1380,6 +1410,44 @@ el método de pago y el estado de la transacción.
             print(f"No se pudieron listar reservas: {e}")
             return []
 
+    def _nombre_estado_reserva(self, estado_id):
+        estado_id_texto = str(estado_id) if estado_id is not None else "N/D"
+        fallback = {
+            1: "Pendiente",
+            2: "Confirmada",
+            3: "Cancelada",
+        }
+
+        try:
+            estado_id_int = int(estado_id)
+        except (TypeError, ValueError):
+            return estado_id_texto
+
+        if getattr(self.postgres, 'cursor', None) is None:
+            return fallback.get(estado_id_int, estado_id_texto)
+
+        try:
+            self.postgres.cursor.execute(
+                """
+                SELECT nombre
+                FROM estado_reserva
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (estado_id_int,),
+            )
+            row = self.postgres.cursor.fetchone()
+            if row and row[0]:
+                return str(row[0])
+        except Exception:
+            try:
+                if getattr(self.postgres, 'connection', None) is not None:
+                    self.postgres.connection.rollback()
+            except Exception:
+                pass
+
+        return fallback.get(estado_id_int, estado_id_texto)
+
     def _mostrar_reservas_anfitrion(self, active_session=None):
         if getattr(self.postgres, 'connection', None) is None or getattr(self.postgres, 'cursor', None) is None:
             print("No hay conexión a Postgres para listar reservas del anfitrión.")
@@ -1425,9 +1493,10 @@ el método de pago y el estado de la transacción.
                 reserva_id, usuario_id, propiedad_id, fecha_inicio, fecha_fin, monto, estado_id = row
                 fecha_inicio_texto = fecha_inicio.isoformat() if hasattr(fecha_inicio, 'isoformat') else str(fecha_inicio)
                 fecha_fin_texto = fecha_fin.isoformat() if hasattr(fecha_fin, 'isoformat') else str(fecha_fin)
+                estado_nombre = self._nombre_estado_reserva(estado_id)
                 print(
                     f"{str(reserva_id):<3} | {str(usuario_id):>7} | {str(propiedad_id):>9} | "
-                    f"{fecha_inicio_texto:<11} | {fecha_fin_texto:<10} | {monto} | {estado_id}"
+                    f"{fecha_inicio_texto:<11} | {fecha_fin_texto:<10} | {monto} | {estado_nombre}"
                 )
         except Exception as e:
             try:
@@ -1614,6 +1683,8 @@ el método de pago y el estado de la transacción.
                 ciudad = input("¿En qué ciudad? (Enter para todas): ").strip() or None
                 tipo = input("¿Tipo de propiedad? (Departamento/Casa/Cabaña/Loft/Habitación, Enter para cualquiera): ").strip() or None
                 precio_max = input("¿Precio máximo por noche en USD? (Enter para cualquiera): ").strip() or None
+                checkin_busqueda = input("Check-in para búsqueda (YYYY-MM-DD, Enter para omitir): ").strip() or "sinfecha"
+                checkout_busqueda = input("Check-out para búsqueda (YYYY-MM-DD, Enter para omitir): ").strip() or "sinfecha"
 
                 query = {"activa": True}
                 if pais:
@@ -1629,11 +1700,65 @@ el método de pago y el estado de la transacción.
                         print("Precio máximo inválido.")
                         continue
 
+                ciudad_cache = (ciudad or "todas").strip().casefold() or "todas"
+                checkin_cache = checkin_busqueda
+                checkout_cache = checkout_busqueda
+                cache_key_busqueda = f"busqueda:{ciudad_cache}:{checkin_cache}:{checkout_cache}"
+
+                resultados = None
+                cached_search = self._redis_get_json(cache_key_busqueda)
+                if isinstance(cached_search, list):
+                    resultados = cached_search
+
+                if resultados is None:
+                    try:
+                        resultados = list(self.mongo.collection.find(query).limit(10))
+                    except Exception as e:
+                        print(f"Error consultando propiedades en MongoDB: {e}")
+                        continue
+
+                    try:
+                        cache_docs = []
+                        for doc in resultados:
+                            ubicacion_cache = doc.get("ubicacion") if isinstance(doc.get("ubicacion"), dict) else {}
+                            cache_docs.append({
+                                "propiedad_pg_id": doc.get("propiedad_pg_id"),
+                                "tipo_propiedad": doc.get("tipo_propiedad"),
+                                "barrio": doc.get("barrio"),
+                                "ubicacion": {
+                                    "ciudad": ubicacion_cache.get("ciudad"),
+                                    "pais": ubicacion_cache.get("pais"),
+                                },
+                                "precio_por_noche": doc.get("precio_por_noche"),
+                                "huespedes_max": doc.get("huespedes_max"),
+                                "cant_habitaciones": doc.get("cant_habitaciones"),
+                                "cant_banios": doc.get("cant_banios"),
+                                "servicios": doc.get("servicios"),
+                                "calificacion_promedio": doc.get("calificacion_promedio"),
+                                "zona_centrica": doc.get("zona_centrica"),
+                            })
+                        self._redis_set_json(cache_key_busqueda, cache_docs, ttl_seconds=300)
+                    except Exception:
+                        pass
+
+                # Ranking por ciudad (Sorted Set en Redis, TTL 1h).
                 try:
-                    resultados = list(self.mongo.collection.find(query).limit(10))
-                except Exception as e:
-                    print(f"Error consultando propiedades en MongoDB: {e}")
-                    continue
+                    if getattr(self.redis, 'client', None) is not None and ciudad:
+                        scores = {}
+                        for doc in resultados:
+                            prop_id = doc.get("propiedad_pg_id")
+                            rating = doc.get("calificacion_promedio")
+                            if prop_id is None:
+                                continue
+                            try:
+                                score = float(rating) if rating is not None else 0.0
+                            except Exception:
+                                score = 0.0
+                            scores[str(prop_id)] = score
+                        if scores:
+                            self.redis.cache_top_properties_by_city(ciudad, scores, ttl_seconds=3600)
+                except Exception:
+                    pass
 
                 if not resultados:
                     print("No se encontraron propiedades con esos filtros")
@@ -1716,6 +1841,13 @@ el método de pago y el estado de la transacción.
                             )
                 except Exception:
                     pass  # No bloquear el flujo si Cassandra falla
+
+                # Incrementar contador de vistas en Redis (INCR crea la clave desde 0 si no existe).
+                try:
+                    if getattr(self.redis, 'client', None) is not None:
+                        self.redis.incr_property_views(propiedad_real_id)
+                except Exception:
+                    pass  # No bloquear el flujo si Redis falla
 
                 inicio = input("Fecha inicio (YYYY-MM-DD): ").strip()
                 fin = input("Fecha fin (YYYY-MM-DD): ").strip()

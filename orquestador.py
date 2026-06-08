@@ -461,13 +461,13 @@ class AirbnbOrchestrator:
             print("\n" + "=" * 30)
             print("=== CASOS DE USO ===")
             print("=" * 30)
-            print("1. ¿Cuántas reservas se realizan en una ciudad específica en el último mes? (Postgres)")
-            print("2. Tipos de alojamiento populares (MongoDB)")
-            print("3. Propiedades agregadas recientemente (MongoDB)")
-            print("4. Mejores anfitriones (MongoDB)")
-            print("5. Barrios más demandados por país (Postgres)")
-            print("6. ¿Cuántas propiedades tienen una calificación mayor a 4.5 y están ubicadas en el centro de la ciudad? (MongoDB)")
-            print("7. Propiedades con +20 reseñas O en zona turística (MongoDB)")
+            print("1. ¿Cuántas reservas se realizan en una ciudad específica en el último mes? (PostgreSQL + Redis)")
+            print("2. ¿Qué tipos de alojamiento son más populares entre los usuarios? (Redis + MongoDB)")
+            print("3. ¿Cuántas propiedades han sido agregadas recientemente en la plataforma? (MongoDB)")
+            print("4. ¿Qué anfitriones tienen las mejores calificaciones? (PostgreSQL, fallback MongoDB)")
+            print("5. ¿Cuáles son las áreas más demandadas para alquileres en un país? (PostgreSQL)")
+            print("6. ¿Cuántas propiedades tienen una calificación mayor a 4.5 Y están ubicadas en el centro de la ciudad? (MongoDB)")
+            print("7. ¿Qué tipos de alojamientos han recibido más de 20 reseñas o están en una zona turística popular? (MongoDB)")
             print("8. Disponibilidad de propiedad en rango de fechas (Cassandra + Redis)")
             print("0. Volver")
 
@@ -1440,17 +1440,31 @@ class AirbnbOrchestrator:
                 try:
                     res = self.publicar_propiedad_business(anfitrion, doc)
                     mongo_info = res.get('mongo') if isinstance(res.get('mongo'), dict) else {}
-                    postgres_info = res.get('postgres') if isinstance(res.get('postgres'), dict) else {}
-                    mongo_id = mongo_info.get('inserted_id', 'N/D')
+                    ubicacion_doc = doc.get('ubicacion') if isinstance(doc.get('ubicacion'), dict) else {}
+                    ubicacion_texto = ", ".join(
+                        [
+                            parte
+                            for parte in [
+                                ubicacion_doc.get('barrio') or barrio,
+                                ubicacion_doc.get('ciudad') or ciudad,
+                                ubicacion_doc.get('pais') or pais,
+                            ]
+                            if parte
+                        ]
+                    ) or "Ubicación no informada"
                     print("\n" + "=" * 50)
                     print("✓ ¡Propiedad publicada exitosamente!")
                     print("=" * 50)
-                    print(f"  ID Propiedad PG  : {res.get('propiedad_pg_id', 'N/D')}")
-                    print(f"  ID MongoDB       : {mongo_id}")
-                    print(f"  Tabla Postgres   : {postgres_info.get('table', 'propiedad')} (ID {postgres_info.get('id', 'N/D')})")
-                    print(f"  Ubicación SQL    : ID {postgres_info.get('ubicacion_id', 'N/D')}")
-                    print(f"  Zona turística   : {'Sí' if res.get('zona_turistica') else 'No'}")
-                    print(f"  Zona céntrica    : {'Sí' if res.get('zona_centrica') else 'No'}")
+                    print(f"  Título        : {titulo or 'Sin título'}")
+                    print(f"  Descripción   : {(descripcion or 'Sin descripción')[:120]}{'...' if len(descripcion or '') > 120 else ''}")
+                    print(f"  Tipo          : {tipo_propiedad or 'No especificado'}")
+                    print(f"  Ubicación     : {ubicacion_texto}")
+                    print(f"  Precio/noche  : {precio if precio else 'N/D'} {moneda if moneda else ''}".rstrip())
+                    print(f"  Huéspedes máx : {huespedes_max if huespedes_max else 'N/D'}")
+                    print(f"  Habitaciones  : {cant_habitaciones if cant_habitaciones else 'N/D'}")
+                    print(f"  Baños         : {cant_banios if cant_banios else 'N/D'}")
+                    print(f"  Zona turística: {'Sí' if res.get('zona_turistica') else 'No'}")
+                    print(f"  Zona céntrica : {'Sí' if res.get('zona_centrica') else 'No'}")
                     if mongo_info.get('warning'):
                         print(f"  ⚠ Aviso Mongo    : {mongo_info.get('warning')}")
                     print("=" * 50)
@@ -1808,7 +1822,7 @@ class AirbnbOrchestrator:
                         try:
                             doc = self.mongo.collection.find_one(
                                 {"propiedad_pg_id": pid},
-                                {"_id": 1, "titulo": 1, "tipo_propiedad": 1, "ubicacion": 1},
+                                {"_id": 1, "titulo": 1, "descripcion": 1, "tipo_propiedad": 1, "ubicacion": 1},
                             )
                             if doc:
                                 propiedades_reservadas.append(doc)
@@ -1830,6 +1844,7 @@ class AirbnbOrchestrator:
                 print("─" * 45)
 
                 propiedad_mongo_id = None
+                propiedad_seleccionada = None
                 while True:
                     sel = input("Seleccione una propiedad (número) o 0 para volver: ").strip()
                     if sel == "0":
@@ -1841,7 +1856,8 @@ class AirbnbOrchestrator:
                     if idx_sel < 1 or idx_sel > len(propiedades_reservadas):
                         print("Número fuera de rango.")
                         continue
-                    propiedad_mongo_id = str(propiedades_reservadas[idx_sel - 1]["_id"])
+                    propiedad_seleccionada = propiedades_reservadas[idx_sel - 1]
+                    propiedad_mongo_id = str(propiedad_seleccionada["_id"])
                     break
 
                 if propiedad_mongo_id is None:
@@ -1868,10 +1884,13 @@ class AirbnbOrchestrator:
                 try:
                     res = self.dejar_resena_business(usuario, propiedad, review['comentario'], review['calificacion'])
                     warning = res.get('warning') if isinstance(res, dict) else None
+                    titulo_propiedad = (propiedad_seleccionada or {}).get("titulo") or "Sin título"
+                    descripcion_propiedad = (propiedad_seleccionada or {}).get("descripcion") or "Sin descripción"
                     print("\n" + "=" * 50)
                     print("✓ ¡Reseña publicada exitosamente!")
                     print("=" * 50)
-                    print(f"  Propiedad : {propiedad}")
+                    print(f"  Título : {titulo_propiedad}")
+                    print(f"  Descripción: {descripcion_propiedad[:120]}{'...' if len(descripcion_propiedad) > 120 else ''}")
                     print(f"  Calificación : {rating} / 5")
                     if comentario:
                         print(f"  Comentario: {comentario[:80]}{'...' if len(comentario) > 80 else ''}")

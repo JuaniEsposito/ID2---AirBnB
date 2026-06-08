@@ -99,21 +99,6 @@ class PostgresRepository:
                 continue
         return None
 
-    def _all_user_tables(self):
-        if not self.connection or not self.cursor:
-            raise RuntimeError("Conexión a Postgres no disponible.")
-
-        self.cursor.execute(
-            """
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_type = 'BASE TABLE'
-            ORDER BY table_name;
-            """
-        )
-        return [row[0] for row in self.cursor.fetchall()]
-
     def _lookup_id_by_nombre(self, table_name, nombre):
         if not nombre:
             return None

@@ -73,7 +73,9 @@ class AirbnbOrchestrator:
         return self._hash_password(password, salt=salt) == stored_value
 
     def _session_ttl(self, trusted_device):
-        return 60 * 60 * 24
+        if trusted_device:
+            return 60 * 60 * 24
+        return 5
 
     def _normalizar_tipo_propiedad(self, tipo_propiedad, titulo=None):
         tipo = (tipo_propiedad or "").strip()
@@ -333,6 +335,22 @@ class AirbnbOrchestrator:
 
         return "huesped"
 
+    def _sesion_activa_en_redis(self, active_session=None):
+        if not active_session:
+            return False
+        if getattr(self.redis, 'client', None) is None:
+            return False
+
+        token = (active_session.get("session_token") if isinstance(active_session, dict) else None) or ""
+        token = token.strip()
+        if not token:
+            return False
+
+        try:
+            return self._redis_get_json(self._auth_session_key(token)) is not None
+        except Exception:
+            return False
+
     def logout_usuario(self, email, session_token=None):
         if getattr(self.redis, 'client', None) is None:
             return "Redis no conectado. No se puede cerrar sesi\u00f3n."
@@ -458,6 +476,10 @@ class AirbnbOrchestrator:
 
     def menu_casos_de_uso(self, active_session=None):
         while True:
+            if active_session and not self._sesion_activa_en_redis(active_session):
+                print("\nTu sesión expiró. Iniciá sesión nuevamente.")
+                return "logout"
+
             print("\n" + "=" * 30)
             print("=== CASOS DE USO ===")
             print("=" * 30)
@@ -472,6 +494,10 @@ class AirbnbOrchestrator:
             print("0. Volver")
 
             opc_raw = input("\nSeleccione una opción: ").strip()
+            if active_session and not self._sesion_activa_en_redis(active_session):
+                print("\nTu sesión expiró. Iniciá sesión nuevamente.")
+                return "logout"
+
             # Tolerate keypad/terminal variants such as +2, 2+ or 02.
             opcion_match = re.fullmatch(r"\+?(\d+)\+?", opc_raw)
             opc = str(int(opcion_match.group(1))) if opcion_match else opc_raw
@@ -996,7 +1022,16 @@ class AirbnbOrchestrator:
             connection.rollback()
             return {"ok": False, "mensaje": f"Error al cancelar reserva: {e}"}
 
-    def dejar_resena_business(self, usuario_id, propiedad_id, texto, rating):
+    def dejar_resena_business(
+        self,
+        usuario_id,
+        propiedad_id,
+        texto,
+        rating,
+        puntaje_limpieza=None,
+        puntaje_comunicacion=None,
+        puntaje_ubicacion=None,
+    ):
         resolved_user_id = self._resolver_usuario_postgres(usuario_id)
         resolved_property_id = self._resolver_propiedad_postgres(propiedad_id)
 
@@ -1015,6 +1050,21 @@ class AirbnbOrchestrator:
         comentario = (comentario or '').strip()
         calificacion = float(rating) if rating is not None else None
 
+        if calificacion is None or calificacion < 0 or calificacion > 5:
+            raise ValueError("La calificación general debe estar entre 0 y 5.")
+
+        def _normalizar_puntaje(valor, nombre_campo):
+            if valor is None:
+                return None
+            puntaje_valor = float(valor)
+            if puntaje_valor < 0 or puntaje_valor > 5:
+                raise ValueError(f"{nombre_campo} debe estar entre 0 y 5.")
+            return puntaje_valor
+
+        puntaje_limpieza = _normalizar_puntaje(puntaje_limpieza, "Puntaje limpieza")
+        puntaje_comunicacion = _normalizar_puntaje(puntaje_comunicacion, "Puntaje comunicación")
+        puntaje_ubicacion = _normalizar_puntaje(puntaje_ubicacion, "Puntaje ubicación")
+
         review = {
             'usuario_id': resolved_user_id,
             'nombre_usuario': None,
@@ -1023,6 +1073,12 @@ class AirbnbOrchestrator:
             'fecha': datetime.now(timezone.utc).isoformat(),
             'visible': True,
         }
+        if puntaje_limpieza is not None:
+            review['puntaje_limpieza'] = puntaje_limpieza
+        if puntaje_comunicacion is not None:
+            review['puntaje_comunicacion'] = puntaje_comunicacion
+        if puntaje_ubicacion is not None:
+            review['puntaje_ubicacion'] = puntaje_ubicacion
 
         # 1) SQL primero; si falla, no se intenta Mongo.
         try:
@@ -1030,6 +1086,9 @@ class AirbnbOrchestrator:
                 autor_id=resolved_user_id,
                 propiedad_id=resolved_property_id,
                 puntaje_general=calificacion,
+                puntaje_limpieza=puntaje_limpieza,
+                puntaje_comunicacion=puntaje_comunicacion,
+                puntaje_ubicacion=puntaje_ubicacion,
                 comentario=comentario,
                 visible=True,
             )
@@ -1302,6 +1361,10 @@ class AirbnbOrchestrator:
 
     def menu_requerimientos(self, active_session=None):
         while True:
+            if active_session and not self._sesion_activa_en_redis(active_session):
+                print("\nTu sesión expiró. Iniciá sesión nuevamente.")
+                return "logout"
+
             tipo_usuario = self._tipo_menu_requerimientos(active_session)
 
             if tipo_usuario == 'huesped':
@@ -1337,6 +1400,10 @@ class AirbnbOrchestrator:
             print("0. Volver")
 
             opc = input("\nSeleccione una opción: ").strip()
+            if active_session and not self._sesion_activa_en_redis(active_session):
+                print("\nTu sesión expiró. Iniciá sesión nuevamente.")
+                return "logout"
+
             if opc == "0":
                 return
 
@@ -1871,18 +1938,54 @@ class AirbnbOrchestrator:
                 puntaje_comunicacion = input("Puntaje comunicación (0-5, Enter para omitir): ").strip() or None
                 puntaje_ubicacion = input("Puntaje ubicación (0-5, Enter para omitir): ").strip() or None
 
+                try:
+                    calificacion_general = float(rating)
+                except ValueError:
+                    print("Calificación inválida. Debe ser un número entre 0 y 5.")
+                    continue
+                if calificacion_general < 0 or calificacion_general > 5:
+                    print("Calificación inválida. Debe estar entre 0 y 5.")
+                    continue
+
+                def _parse_score_input(raw_value, label):
+                    if raw_value is None:
+                        return None
+                    try:
+                        parsed = float(raw_value)
+                    except ValueError:
+                        raise ValueError(f"{label} inválido. Debe ser un número entre 0 y 5.")
+                    if parsed < 0 or parsed > 5:
+                        raise ValueError(f"{label} inválido. Debe estar entre 0 y 5.")
+                    return parsed
+
+                try:
+                    puntaje_limpieza_val = _parse_score_input(puntaje_limpieza, "Puntaje limpieza")
+                    puntaje_comunicacion_val = _parse_score_input(puntaje_comunicacion, "Puntaje comunicación")
+                    puntaje_ubicacion_val = _parse_score_input(puntaje_ubicacion, "Puntaje ubicación")
+                except ValueError as validation_error:
+                    print(str(validation_error))
+                    continue
+
                 review = {
-                    'calificacion': float(rating),
+                    'calificacion': calificacion_general,
                     'comentario': comentario,
                 }
-                if puntaje_limpieza:
-                    review['puntaje_limpieza'] = int(puntaje_limpieza)
-                if puntaje_comunicacion:
-                    review['puntaje_comunicacion'] = int(puntaje_comunicacion)
-                if puntaje_ubicacion:
-                    review['puntaje_ubicacion'] = int(puntaje_ubicacion)
+                if puntaje_limpieza_val is not None:
+                    review['puntaje_limpieza'] = puntaje_limpieza_val
+                if puntaje_comunicacion_val is not None:
+                    review['puntaje_comunicacion'] = puntaje_comunicacion_val
+                if puntaje_ubicacion_val is not None:
+                    review['puntaje_ubicacion'] = puntaje_ubicacion_val
                 try:
-                    res = self.dejar_resena_business(usuario, propiedad, review['comentario'], review['calificacion'])
+                    res = self.dejar_resena_business(
+                        usuario,
+                        propiedad,
+                        review['comentario'],
+                        review['calificacion'],
+                        puntaje_limpieza=review.get('puntaje_limpieza'),
+                        puntaje_comunicacion=review.get('puntaje_comunicacion'),
+                        puntaje_ubicacion=review.get('puntaje_ubicacion'),
+                    )
                     warning = res.get('warning') if isinstance(res, dict) else None
                     titulo_propiedad = (propiedad_seleccionada or {}).get("titulo") or "Sin título"
                     descripcion_propiedad = (propiedad_seleccionada or {}).get("descripcion") or "Sin descripción"
@@ -2325,6 +2428,10 @@ def menu():
     active_session = None
 
     while True:
+        if active_session and not orch._sesion_activa_en_redis(active_session):
+            print("\nTu sesión expiró. Iniciá sesión nuevamente.")
+            active_session = None
+
         if not active_session:
             print("\n" + "=" * 30)
             print("=== AIRBNB POLÍGLOTA CLI ===")
@@ -2348,7 +2455,11 @@ def menu():
                 print("\n--- Inicio de sesión ---")
                 email = input("Ingrese su email: ").strip()
                 password = getpass.getpass("Ingrese su contraseña: ").strip()
-                trusted = input("¿El dispositivo es de confianza? (1=sí, 0=no): ").strip()
+                trusted = ""
+                while trusted not in {"0", "1"}:
+                    trusted = input("¿El dispositivo es de confianza? (1=sí, 0=no): ").strip()
+                    if trusted not in {"0", "1"}:
+                        print("⚠ Opción inválida. Ingrese solo 1 o 0.")
                 trusted_device = trusted == "1"
                 session, error = orch.login_usuario(email, password, trusted_device)
                 if error:
@@ -2386,6 +2497,11 @@ def menu():
 
         opc = input("\nSeleccione una opción: ").strip()
 
+        if active_session and not orch._sesion_activa_en_redis(active_session):
+            print("\nTu sesión expiró. Iniciá sesión nuevamente.")
+            active_session = None
+            continue
+
         if opc == "1" and tipo_sesion == "admin":
             result = orch.menu_casos_de_uso(active_session=active_session)
             if result == "logout":
@@ -2407,7 +2523,10 @@ def menu():
             except Exception as e:
                 print(f"Error analítica: {e}")
         elif opc == "1" and tipo_sesion != "admin":
-            orch.menu_requerimientos(active_session=active_session)
+            result = orch.menu_requerimientos(active_session=active_session)
+            if result == "logout":
+                active_session = None
+                continue
         elif opc == "0":
             print(orch.logout_usuario(active_session.get('email'), session_token=active_session.get('session_token')))
             active_session = None

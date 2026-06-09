@@ -688,7 +688,17 @@ class PostgresRepository:
         self.cursor.execute(query, tuple(params))
         return self.cursor.fetchone() is not None
 
-    def create_review(self, autor_id, propiedad_id, puntaje_general, comentario=None, visible=True):
+    def create_review(
+        self,
+        autor_id,
+        propiedad_id,
+        puntaje_general,
+        puntaje_limpieza=None,
+        puntaje_comunicacion=None,
+        puntaje_ubicacion=None,
+        comentario=None,
+        visible=True,
+    ):
         if not self.connection or not self.cursor:
             raise RuntimeError("Conexión a Postgres no disponible.")
 
@@ -701,16 +711,31 @@ class PostgresRepository:
         if not required.issubset(columns):
             raise RuntimeError('La tabla de reseñas no tiene las columnas mínimas esperadas: autor_id, propiedad_id, puntaje_general.')
 
-        puntaje = int(round(float(puntaje_general)))
-        puntaje = max(1, min(5, puntaje))
+        puntaje = float(puntaje_general)
+        if puntaje < 0 or puntaje > 5:
+            raise ValueError('puntaje_general debe estar entre 0 y 5.')
+        puntaje = int(round(puntaje))
 
         insert_columns = ['autor_id', 'propiedad_id', 'puntaje_general']
         insert_values = [autor_id, propiedad_id, puntaje]
 
+        score_inputs = {
+            'puntaje_limpieza': puntaje_limpieza,
+            'puntaje_comunicacion': puntaje_comunicacion,
+            'puntaje_ubicacion': puntaje_ubicacion,
+        }
         for score_col in ['puntaje_limpieza', 'puntaje_comunicacion', 'puntaje_ubicacion']:
             if score_col in columns:
+                score_value = score_inputs.get(score_col)
+                if score_value is None:
+                    score_to_insert = puntaje
+                else:
+                    score_to_insert = float(score_value)
+                    if score_to_insert < 0 or score_to_insert > 5:
+                        raise ValueError(f'{score_col} debe estar entre 0 y 5.')
+                    score_to_insert = int(round(score_to_insert))
                 insert_columns.append(score_col)
-                insert_values.append(puntaje)
+                insert_values.append(score_to_insert)
 
         if 'comentario' in columns:
             insert_columns.append('comentario')

@@ -138,9 +138,44 @@ class PostgresRepository:
             return "anfitrion"
         if tipo_sin_tilde in {"huesped", "huesped/a", "guest"} or "huesp" in tipo_sin_tilde:
             return "huesped"
+        if tipo_sin_tilde in {"admin", "administrador"}:
+            return "admin"
         if tipo_sin_tilde == "ambos" or "amb" in tipo_sin_tilde:
-            return "ambos"
-        return "ambos"
+            return "huesped"
+        return "huesped"
+
+    def actualizar_tipo_usuario_por_email(self, email, user_type):
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        email_normalizado = (email or "").strip().casefold()
+        if not email_normalizado:
+            return {"updated": 0}
+
+        if not self._table_has_columns("usuario", ["tipo", "email"]):
+            return {"updated": 0}
+
+        tipo_normalizado = self._normalize_user_type(user_type)
+
+        try:
+            self.cursor.execute(
+                """
+                UPDATE usuario
+                SET tipo = %s
+                WHERE LOWER(TRIM(COALESCE(email, ''))) = %s
+                  AND LOWER(TRIM(COALESCE(tipo, ''))) <> %s;
+                """,
+                (tipo_normalizado, email_normalizado, tipo_normalizado),
+            )
+            updated = self.cursor.rowcount or 0
+            self.connection.commit()
+            return {"updated": int(updated)}
+        except Psycopg2Error:
+            self.connection.rollback()
+            raise
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def _sync_identity_sequence(self, table_name, id_column="id"):
         if not self.connection or not self.cursor:
@@ -567,6 +602,56 @@ class PostgresRepository:
             updated = self.cursor.rowcount or 0
             self.connection.commit()
             return {"updated": int(updated)}
+        except Psycopg2Error:
+            self.connection.rollback()
+            raise
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def asegurar_rol_admin_en_usuario(self):
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        if not self._table_has_columns("usuario", ["tipo"]):
+            return {"updated": False, "reason": "usuario.tipo no existe"}
+
+        try:
+            self.cursor.execute(
+                """
+                SELECT pg_get_constraintdef(pg_constraint.oid)
+                FROM pg_constraint
+                WHERE conrelid = 'usuario'::regclass
+                  AND contype = 'c'
+                  AND conname = 'usuario_tipo_check'
+                LIMIT 1;
+                """
+            )
+            row = self.cursor.fetchone()
+            definition = (row[0] if row else "") or ""
+            if "admin" in definition.casefold():
+                self.connection.commit()
+                return {"updated": False, "reason": "constraint ya permite admin"}
+
+            self.cursor.execute(
+                """
+                UPDATE usuario
+                SET tipo = 'huesped'
+                WHERE LOWER(TRIM(COALESCE(tipo, ''))) = 'ambos';
+                """
+            )
+            migrated = self.cursor.rowcount or 0
+
+            self.cursor.execute("ALTER TABLE usuario DROP CONSTRAINT IF EXISTS usuario_tipo_check;")
+            self.cursor.execute(
+                """
+                ALTER TABLE usuario
+                ADD CONSTRAINT usuario_tipo_check
+                CHECK (LOWER(TRIM(COALESCE(tipo, ''))) IN ('huesped', 'anfitrion', 'admin'));
+                """
+            )
+            self.connection.commit()
+            return {"updated": True, "migrated_ambos": int(migrated)}
         except Psycopg2Error:
             self.connection.rollback()
             raise
@@ -1203,6 +1288,67 @@ class PostgresRepository:
                 continue
         return {'updated': False, 'mensaje': 'No se encontró tabla de metadatos para actualizar promedio.'}
 
+    def actualizar_promedio_propiedad_desde_resenias(self, propiedad_id):
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        table_resenia = self._first_existing_table(['resenia', 'resenias', 'review', 'reviews'])
+        table_propiedad = self._first_existing_table(['propiedad', 'propiedades'])
+
+        if not table_resenia or not table_propiedad:
+            return {'updated': False, 'mensaje': 'No se encontraron tablas compatibles de reseñas/propiedades.'}
+
+        cols_resenia = self._table_columns(table_resenia)
+        cols_propiedad = self._table_columns(table_propiedad)
+
+        if 'propiedad_id' not in cols_resenia or 'puntaje_general' not in cols_resenia:
+            return {'updated': False, 'mensaje': 'La tabla de reseñas no tiene columnas esperadas.'}
+
+        if 'calificacion_promedio' not in cols_propiedad:
+            return {'updated': False, 'mensaje': 'La tabla de propiedades no tiene columna calificacion_promedio.'}
+
+        propiedad_pk = 'id' if 'id' in cols_propiedad else ('propiedad_id' if 'propiedad_id' in cols_propiedad else None)
+        if propiedad_pk is None:
+            return {'updated': False, 'mensaje': 'No se pudo resolver la PK de la tabla de propiedades.'}
+
+        visible_clause = " AND COALESCE(visible, TRUE) = TRUE" if 'visible' in cols_resenia else ""
+
+        try:
+            self.cursor.execute(
+                f"""
+                SELECT AVG(puntaje_general)::numeric
+                FROM {table_resenia}
+                WHERE propiedad_id = %s{visible_clause};
+                """,
+                (propiedad_id,),
+            )
+            row = self.cursor.fetchone()
+            promedio = row[0] if row else None
+
+            self.cursor.execute(
+                f"""
+                UPDATE {table_propiedad}
+                SET calificacion_promedio = %s
+                WHERE {propiedad_pk} = %s;
+                """,
+                (float(promedio) if promedio is not None else None, propiedad_id),
+            )
+            updated_rows = self.cursor.rowcount or 0
+            self.connection.commit()
+
+            return {
+                'updated': updated_rows > 0,
+                'rows': int(updated_rows),
+                'table': table_propiedad,
+                'promedio': float(promedio) if promedio is not None else None,
+            }
+        except Psycopg2Error:
+            self.connection.rollback()
+            raise
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def count_reservations_by_city(self, city):
         if not self.connection or not self.cursor:
             raise RuntimeError("Conexión a Postgres no disponible.")
@@ -1219,6 +1365,28 @@ class PostgresRepository:
             )
             row = self.cursor.fetchone()
             return int(row[0]) if row else 0
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def list_available_cities(self):
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        try:
+            if not self._table_has_columns("ubicacion", ["ciudad"]):
+                return []
+
+            self.cursor.execute(
+                """
+                SELECT DISTINCT TRIM(ciudad) AS ciudad
+                FROM ubicacion
+                WHERE TRIM(COALESCE(ciudad, '')) <> ''
+                ORDER BY ciudad ASC;
+                """
+            )
+            rows = self.cursor.fetchall() or []
+            return [row[0] for row in rows if row and row[0]]
         except Exception:
             self.connection.rollback()
             raise

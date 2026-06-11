@@ -4,6 +4,7 @@ import getpass
 import logging
 import platform
 import re
+import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -20,6 +21,10 @@ from db_connectors.redis_repository import RedisRepository
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+PAUSA_EXITO_SEGUNDOS = 1.0
+PAUSA_ERROR_SEGUNDOS = 1.5
+PAUSA_LISTADO_SEGUNDOS = 0.5
 
 
 class AirbnbOrchestrator:
@@ -120,6 +125,11 @@ class AirbnbOrchestrator:
         except Exception:
             pass
 
+        try:
+            self.postgres.asegurar_rol_admin_en_usuario()
+        except Exception:
+            pass
+
         if getattr(self.redis, 'client', None) is None:
             return
 
@@ -128,9 +138,18 @@ class AirbnbOrchestrator:
                 key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
                 user_doc = self.redis.get_json(key) or {}
                 tipo_actual = user_doc.get("tipo")
-                if self._normalizar_tipo_usuario(tipo_actual) == "huesped" and (tipo_actual or "").strip().casefold() in {"ambos", "amb"}:
-                    user_doc["tipo"] = "huesped"
+                tipo_normalizado = self._normalizar_tipo_usuario(tipo_actual)
+
+                if (tipo_actual or "").strip().casefold() != tipo_normalizado:
+                    user_doc["tipo"] = tipo_normalizado
                     self.redis.set_json(key, user_doc)
+
+                email = self._normalize_email(user_doc.get("email"))
+                if email and tipo_normalizado in {"huesped", "anfitrion", "admin"}:
+                    try:
+                        self.postgres.actualizar_tipo_usuario_por_email(email, tipo_normalizado)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -396,7 +415,11 @@ class AirbnbOrchestrator:
         return f"Sesi\u00f3n cerrada para {email_normalizado}."
 
     def disponibilidad_propiedad_rango(self, propiedad_id, fecha_inicio, fecha_fin):
-        propiedad_id = str(propiedad_id).strip()
+        resolved_property_id = self._resolver_propiedad_postgres(propiedad_id)
+        if resolved_property_id is None:
+            return "La propiedad indicada no existe."
+
+        propiedad_id = str(resolved_property_id).strip()
         fecha_inicio = (fecha_inicio or "").strip()
         fecha_fin = (fecha_fin or "").strip()
 
@@ -406,18 +429,109 @@ class AirbnbOrchestrator:
         cache_key = f"availability:{propiedad_id}:{fecha_inicio}:{fecha_fin}"
         cached = self._redis_get_json(cache_key)
         if cached is not None:
-            return f"Disponibilidad consultada desde Redis: {cached}"
+            return self._formatear_resultado_disponibilidad(cached, fecha_inicio, fecha_fin)
 
         try:
             resultado = self.cassandra.check_property_availability(propiedad_id, fecha_inicio, fecha_fin)
             if getattr(self.redis, 'client', None) is not None:
                 self._redis_set_json(cache_key, resultado, ttl_seconds=300)
 
-            if resultado.get("available"):
-                return f"Propiedad disponible: {resultado}"
-            return f"Propiedad no disponible: {resultado}"
+            return self._formatear_resultado_disponibilidad(resultado, fecha_inicio, fecha_fin)
         except Exception as e:
             return f"Error al consultar disponibilidad: {e}"
+
+    def _formatear_resultado_disponibilidad(self, resultado, fecha_inicio, fecha_fin):
+        if not isinstance(resultado, dict):
+            return "No se pudo interpretar la disponibilidad de la propiedad."
+
+        inicio = resultado.get('start_date', fecha_inicio)
+        fin = resultado.get('end_date', fecha_fin)
+
+        if resultado.get("available"):
+            return f"Disponible del {inicio} al {fin}."
+
+        unavailable_days = resultado.get("unavailable_days") or []
+        if unavailable_days:
+            dias_texto = ", ".join(str(day) for day in unavailable_days)
+            return f"No disponible entre {inicio} y {fin}. Días ocupados: {dias_texto}."
+
+        return f"No disponible entre {inicio} y {fin}."
+
+    def _propiedad_existe_en_postgres(self, propiedad_id):
+        if getattr(self.postgres, 'connection', None) is None or getattr(self.postgres, 'cursor', None) is None:
+            return None
+
+        try:
+            self.postgres.cursor.execute(
+                """
+                SELECT 1
+                FROM propiedad
+                WHERE id = %s
+                LIMIT 1;
+                """,
+                (int(propiedad_id),),
+            )
+            return self.postgres.cursor.fetchone() is not None
+        except Exception:
+            try:
+                self.postgres.connection.rollback()
+            except Exception:
+                pass
+            return None
+
+    def _listar_propiedades_para_disponibilidad(self, limite=20):
+        if getattr(self.mongo, 'collection', None) is None:
+            return []
+
+        try:
+            docs = list(
+                self.mongo.collection.find(
+                    {"activa": True},
+                    {"_id": 1, "propiedad_pg_id": 1, "titulo": 1, "ubicacion": 1},
+                ).limit(limite)
+            )
+        except Exception:
+            return []
+
+        opciones = []
+        for doc in docs:
+            propiedad_pg_id = doc.get("propiedad_pg_id")
+            if propiedad_pg_id is None:
+                continue
+            titulo = (doc.get("titulo") or "Sin título").strip()
+            ubicacion = doc.get("ubicacion") if isinstance(doc.get("ubicacion"), dict) else {}
+            ciudad = (ubicacion.get("ciudad") or "N/D").strip()
+            opciones.append(
+                {
+                    "propiedad_id": str(propiedad_pg_id),
+                    "titulo": titulo,
+                    "ciudad": ciudad,
+                }
+            )
+        return opciones
+
+    def _seleccionar_propiedad_disponibilidad_cli(self, limite=20):
+        opciones = self._listar_propiedades_para_disponibilidad(limite=limite)
+        if not opciones:
+            return None
+
+        print("Propiedades disponibles para consultar:")
+        for idx, item in enumerate(opciones, start=1):
+            print(f"  {idx}. {item.get('titulo')} | {item.get('ciudad')} | ID {item.get('propiedad_id')}")
+
+        while True:
+            seleccion = input("Seleccione una propiedad (número) o 0 para volver: ").strip()
+            if seleccion == "0":
+                return None
+            if not seleccion.isdigit():
+                print("Opción inválida. Debe ingresar un número de la lista.")
+                continue
+
+            indice = int(seleccion)
+            if 1 <= indice <= len(opciones):
+                return opciones[indice - 1].get("propiedad_id")
+
+            print("Índice fuera de rango. Intente nuevamente.")
 
     def registrar_login_evento(self, email, trusted_device):
         event_payload = {
@@ -473,6 +587,19 @@ class AirbnbOrchestrator:
         except Exception:
             pass
 
+    def _pausa_ui(self, tipo="exito", listado_largo=False):
+        if listado_largo:
+            segundos = PAUSA_LISTADO_SEGUNDOS
+        elif tipo == "error":
+            segundos = PAUSA_ERROR_SEGUNDOS
+        else:
+            segundos = PAUSA_EXITO_SEGUNDOS
+
+        try:
+            time.sleep(segundos)
+        except Exception:
+            pass
+
 
     def menu_casos_de_uso(self, active_session=None):
         while True:
@@ -506,39 +633,53 @@ class AirbnbOrchestrator:
             if opc == "1":
                 ciudad = input("Ingrese la ciudad a consultar (ej: 'Buenos Aires'): ")
                 print(f"\n> Resultado: {self.contar_reservas_ciudad_ultimo_mes(ciudad)}")
+                self._pausa_ui("exito")
             elif opc == "2":
                 print("\n> Consultando agregación en MongoDB...")
                 print(self.alojamiento_mas_popular())
+                self._pausa_ui("exito", listado_largo=True)
             elif opc == "3":
                 dias = input("Ingrese la cantidad de días para buscar propiedades recientes (ej: 30): ").strip() or "30"
                 print(self.propiedades_recientes(dias=dias))
+                self._pausa_ui("exito", listado_largo=True)
             elif opc == "4":
                 limite = input("Ingrese cuántos anfitriones mostrar (ej: 5): ").strip() or "5"
                 print(self.mejores_anfitriones(limite=int(limite)))
+                self._pausa_ui("exito", listado_largo=True)
             elif opc == "5":
                 pais = input("Ingrese el país a analizar (ej: Argentina): ")
                 limite = input("Ingrese cuántas áreas mostrar (ej: 10): ").strip() or "10"
                 print(self.areas_mas_demandadas_pais(pais, limite=int(limite)))
+                self._pausa_ui("exito", listado_largo=True)
             elif opc == "6":
                 print("\n> Consultando propiedades con calificación mayor a 4.5 en CABA...")
                 resultados = self.mongo.properties_with_high_rating_in_center(min_rating=4.5, ciudad="CABA")
                 if not resultados:
                     print("No se encontraron propiedades en CABA con calificación mayor o igual a 4.5.")
+                    self._pausa_ui("error")
                 else:
                     print(f"Se encontraron {len(resultados)} propiedades en CABA con calificación mayor o igual a 4.5.")
                     print(self._formatear_propiedades_mongo(resultados, titulo="PROPIEDADES EN CABA CON CALIFICACIÓN >= 4.5"))
+                    self._pausa_ui("exito", listado_largo=True)
             elif opc == "7":
                 min_reviews = input("Ingrese la cantidad mínima de reseñas (ej: 20): ").strip() or "20"
                 print(self.propiedades_mas_resenadas_o_zona_turistica(min_reviews=int(min_reviews)))
+                self._pausa_ui("exito", listado_largo=True)
             elif opc == "8":
-                propiedad_id = input("Ingrese el propiedad_id a consultar: ").strip()
+                propiedad_id = self._seleccionar_propiedad_disponibilidad_cli(limite=20)
+                if not propiedad_id:
+                    print("Consulta de disponibilidad cancelada.")
+                    self._pausa_ui("error")
+                    continue
                 fecha_inicio = input("Ingrese fecha inicio (YYYY-MM-DD): ").strip()
                 fecha_fin = input("Ingrese fecha fin (YYYY-MM-DD): ").strip()
                 resultado = self.disponibilidad_propiedad_rango(propiedad_id, fecha_inicio, fecha_fin)
                 print("\n> Resultado de disponibilidad:")
                 print(resultado)
+                self._pausa_ui("exito")
             else:
                 print("\n⚠ Opción no válida. Intente nuevamente.")
+                self._pausa_ui("error")
 
 
     # Business-level helpers
@@ -777,9 +918,20 @@ class AirbnbOrchestrator:
             return None
 
         if isinstance(valor, str) and valor.isdigit():
-            return int(valor)
+            valor = int(valor)
+
         if isinstance(valor, int):
-            return valor
+            existe = self._propiedad_existe_en_postgres(valor)
+            if existe is False:
+                return None
+            if existe is True:
+                return valor
+
+            # Fallback cuando no se puede validar en Postgres: buscar mapping en Mongo.
+            propiedad_fallback = self._buscar_propiedad_para_reserva(str(valor))
+            if propiedad_fallback and propiedad_fallback.get("propiedad_pg_id") is not None:
+                return int(propiedad_fallback.get("propiedad_pg_id")) if str(propiedad_fallback.get("propiedad_pg_id")).isdigit() else propiedad_fallback.get("propiedad_pg_id")
+            return None
 
         propiedad = self._buscar_propiedad_para_reserva(valor)
         if not propiedad:
@@ -788,8 +940,14 @@ class AirbnbOrchestrator:
         propiedad_pg_id = propiedad.get("propiedad_pg_id")
         if propiedad_pg_id is None:
             return None
+        propiedad_pg_id = int(propiedad_pg_id) if str(propiedad_pg_id).isdigit() else propiedad_pg_id
 
-        return int(propiedad_pg_id) if str(propiedad_pg_id).isdigit() else propiedad_pg_id
+        if isinstance(propiedad_pg_id, int):
+            existe = self._propiedad_existe_en_postgres(propiedad_pg_id)
+            if existe is False:
+                return None
+
+        return propiedad_pg_id
 
     def realizar_reserva_business(self, usuario_id, propiedad_id, inicio, fin, monto=None, metodo_pago_id=None):
         cassandra_check_warning = None
@@ -1124,25 +1282,9 @@ class AirbnbOrchestrator:
                 f"No se pudo guardar la reseña en Mongo; se intentó revertir SQL para mantener consistencia: {mongo_err}"
             )
 
-        # Attempt to update denormalized average in Postgres
+        # Recalcular promedio en SQL tomando todas las reseñas de la propiedad.
         try:
-            avg = None
-            try:
-                prop = self.mongo.collection.find_one({'_id': ObjectId(mongo_property_id) if ObjectId.is_valid(mongo_property_id) else mongo_property_id})
-            except Exception:
-                prop = None
-
-            if prop:
-                ratings = []
-                for item in prop.get('resenas', []) or []:
-                    value = item.get('calificacion')
-                    if isinstance(value, (int, float)):
-                        ratings.append(float(value))
-                if ratings:
-                    avg = sum(ratings) / len(ratings)
-
-            if avg is not None:
-                self.postgres.actualizar_promedio_propiedad_desde_mongo(resolved_property_id, avg)
+            self.postgres.actualizar_promedio_propiedad_desde_resenias(resolved_property_id)
         except Psycopg2Error:
             warning_text = 'La reseña se guardó en SQL y Mongo pero no se pudo actualizar el promedio en Postgres.'
             return {'mongo': mongo_res, 'sql_resenia': sql_review_res, 'warning': warning_text}
@@ -1348,6 +1490,63 @@ class AirbnbOrchestrator:
                 pass
             print(f"No se pudieron listar reservas del anfitrión: {e}")
 
+    def _mostrar_reservas_huesped(self, active_session=None):
+        if getattr(self.postgres, 'connection', None) is None or getattr(self.postgres, 'cursor', None) is None:
+            print("No hay conexión a Postgres para listar reservas del huésped.")
+            return
+
+        email = self._normalize_email(active_session.get('email') if isinstance(active_session, dict) else None)
+        if not email:
+            print("No se encontró email de sesión para identificar al huésped.")
+            return
+
+        try:
+            usuario = self.postgres.get_user_by_email(email)
+        except Exception as e:
+            print(f"No se pudo resolver huésped por email: {e}")
+            return
+
+        huesped_id = usuario.get('id') if isinstance(usuario, dict) else None
+        if huesped_id is None:
+            print("No existe un usuario huésped en Postgres para el email de la sesión activa.")
+            return
+
+        cursor = self.postgres.cursor
+        try:
+            cursor.execute(
+                """
+                SELECT r.id, r.propiedad_id, r.fecha_inicio, r.fecha_fin, r.monto_total, r.estado_id
+                FROM reserva r
+                WHERE r.usuario_id = %s
+                ORDER BY r.id DESC
+                """,
+                (int(huesped_id),),
+            )
+            rows = cursor.fetchall() or []
+
+            print("\nMis reservas:")
+            print("ID  | Propiedad | Fecha inicio | Fecha fin  | Monto | Estado")
+            print("---------------------------------------------------------------")
+            if not rows:
+                print("(sin resultados)")
+                return
+
+            for row in rows:
+                reserva_id, propiedad_id, fecha_inicio, fecha_fin, monto, estado_id = row
+                fecha_inicio_texto = fecha_inicio.isoformat() if hasattr(fecha_inicio, 'isoformat') else str(fecha_inicio)
+                fecha_fin_texto = fecha_fin.isoformat() if hasattr(fecha_fin, 'isoformat') else str(fecha_fin)
+                estado_nombre = self._nombre_estado_reserva(estado_id)
+                print(
+                    f"{str(reserva_id):<3} | {str(propiedad_id):>9} | {fecha_inicio_texto:<11} | "
+                    f"{fecha_fin_texto:<10} | {monto} | {estado_nombre}"
+                )
+        except Exception as e:
+            try:
+                self.postgres.connection.rollback()
+            except Exception:
+                pass
+            print(f"No se pudieron listar reservas del huésped: {e}")
+
     def _tipo_menu_requerimientos(self, active_session=None):
         raw_tipo = (active_session.get('tipo') if isinstance(active_session, dict) else None)
         tipo = (raw_tipo or '').strip().casefold()
@@ -1372,6 +1571,7 @@ class AirbnbOrchestrator:
                     ("1", "Hacer reserva (Postgres + Cassandra + Redis)"),
                     ("2", "Cancelar mi reserva (Postgres)"),
                     ("3", "Dejar reseña (Mongo + Postgres)"),
+                    ("4", "Ver mis reservas (Postgres)"),
                 ]
             elif tipo_usuario == 'anfitrion':
                 opciones = [
@@ -1385,10 +1585,11 @@ class AirbnbOrchestrator:
                     ("1", "Hacer reserva (Postgres + Cassandra + Redis)"),
                     ("2", "Cancelar mi reserva (Postgres)"),
                     ("3", "Dejar reseña (Mongo + Postgres)"),
-                    ("4", "Publicar propiedad (MongoDB + Postgres)"),
-                    ("5", "Ver reservas de mis propiedades (Postgres)"),
-                    ("6", "Confirmar pago de una reserva (Postgres)"),
-                    ("7", "Cancelar reserva (Postgres)"),
+                    ("4", "Ver mis reservas (Postgres)"),
+                    ("5", "Publicar propiedad (MongoDB + Postgres)"),
+                    ("6", "Ver reservas de mis propiedades (Postgres)"),
+                    ("7", "Confirmar pago de una reserva (Postgres)"),
+                    ("8", "Cancelar reserva (Postgres)"),
                 ]
 
             print("\n" + "=" * 30)
@@ -1412,6 +1613,7 @@ class AirbnbOrchestrator:
                     "1": "hacer_reserva",
                     "2": "cancelar_mi_reserva",
                     "3": "dejar_resena",
+                    "4": "ver_mis_reservas",
                 }.get(opc)
             elif tipo_usuario == 'anfitrion':
                 accion = {
@@ -1425,10 +1627,11 @@ class AirbnbOrchestrator:
                     "1": "hacer_reserva",
                     "2": "cancelar_mi_reserva",
                     "3": "dejar_resena",
-                    "4": "publicar_propiedad",
-                    "5": "ver_reservas_anfitrion",
-                    "6": "confirmar_pago",
-                    "7": "cancelar_reserva",
+                    "4": "ver_mis_reservas",
+                    "5": "publicar_propiedad",
+                    "6": "ver_reservas_anfitrion",
+                    "7": "confirmar_pago",
+                    "8": "cancelar_reserva",
                 }.get(opc)
 
             if accion == "publicar_propiedad":
@@ -1535,8 +1738,10 @@ class AirbnbOrchestrator:
                     if mongo_info.get('warning'):
                         print(f"  ⚠ Aviso Mongo    : {mongo_info.get('warning')}")
                     print("=" * 50)
+                    self._pausa_ui("exito", listado_largo=True)
                 except Exception as e:
                     print(f"✗ Error publicando propiedad: {e}")
+                    self._pausa_ui("error")
             elif accion == "hacer_reserva":
                 print("\n--- Realizar reserva (Postgres + Cassandra + Redis) ---")
 
@@ -1772,6 +1977,7 @@ class AirbnbOrchestrator:
                     if isinstance(res, dict) and res.get('warning'):
                         print(f"  Aviso: {res.get('warning')}")
                     print("=" * 50)
+                    self._pausa_ui("exito", listado_largo=True)
                 except Exception as e:
                     error_text = str(e)
                     if "La propiedad no está disponible en las fechas seleccionadas" in error_text:
@@ -1782,6 +1988,7 @@ class AirbnbOrchestrator:
                         print("No pudimos validar la disponibilidad en este momento. Por favor intentá nuevamente en unos minutos.")
                     else:
                         print(f"Error realizando reserva: {e}")
+                    self._pausa_ui("error")
             elif accion == "cancelar_mi_reserva":
                 print("\n--- Cancelar mi reserva (Postgres) ---")
                 usuario_sesion = self._resolver_usuario_postgres(active_session.get('email') if active_session else None)
@@ -1853,10 +2060,13 @@ class AirbnbOrchestrator:
                         print(f"  Reservas actualizadas: {res.get('reservas_actualizadas', 0)}")
                         print(f"  Pagos actualizados: {res.get('pagos_actualizados', 0)}")
                         print("=" * 50)
+                        self._pausa_ui("exito")
                     else:
                         print(f"Error cancelando reserva: {res.get('mensaje', 'Error desconocido')}")
+                        self._pausa_ui("error")
                 except Exception as e:
                     print(f"Error cancelando reserva: {e}")
+                    self._pausa_ui("error")
             elif accion == "dejar_resena":
                 print("\n--- Dejar reseña (Mongo + Postgres update) ---")
                 usuario_email = (active_session.get('email') if active_session else None)
@@ -2000,11 +2210,18 @@ class AirbnbOrchestrator:
                     if warning:
                         print(f"  ⚠ Aviso   : {warning}")
                     print("=" * 50)
+                    self._pausa_ui("exito", listado_largo=True)
                 except Exception as e:
                     print(f"Error dejando reseña: {e}")
+                    self._pausa_ui("error")
+            elif accion == "ver_mis_reservas":
+                print("\n--- Ver mis reservas (Postgres) ---")
+                self._mostrar_reservas_huesped(active_session)
+                self._pausa_ui("exito", listado_largo=True)
             elif accion == "ver_reservas_anfitrion":
                 print("\n--- Ver reservas de mis propiedades (Postgres) ---")
                 self._mostrar_reservas_anfitrion(active_session)
+                self._pausa_ui("exito", listado_largo=True)
             elif accion == "confirmar_pago":
                 print("\n--- Confirmar pago de una reserva (Postgres) ---")
                 try:
@@ -2047,10 +2264,13 @@ class AirbnbOrchestrator:
                         print(f"  Pagos actualizados: {res.get('pagos_actualizados', 0)}")
                         print(f"  Reservas actualizadas: {res.get('reservas_actualizadas', 0)}")
                         print("=" * 50)
+                        self._pausa_ui("exito")
                     else:
                         print(f"Error confirmando pago: {res.get('mensaje', 'Error desconocido')}")
+                        self._pausa_ui("error")
                 except Exception as e:
                     print(f"Error confirmando pago: {e}")
+                    self._pausa_ui("error")
             elif accion == "cancelar_reserva":
                 print("\n--- Cancelar reserva (Postgres) ---")
                 try:
@@ -2093,12 +2313,16 @@ class AirbnbOrchestrator:
                         print(f"  Reservas actualizadas: {res.get('reservas_actualizadas', 0)}")
                         print(f"  Pagos actualizados: {res.get('pagos_actualizados', 0)}")
                         print("=" * 50)
+                        self._pausa_ui("exito")
                     else:
                         print(f"Error cancelando reserva: {res.get('mensaje', 'Error desconocido')}")
+                        self._pausa_ui("error")
                 except Exception as e:
                     print(f"Error cancelando reserva: {e}")
+                    self._pausa_ui("error")
             else:
                 print("\n⚠ Opción no válida para el tipo de usuario actual. Intente nuevamente.")
+                self._pausa_ui("error")
 
     def clear_redis_keys(self, pattern):
         """Delete keys matching pattern from Redis. Returns message with number deleted."""
@@ -2464,12 +2688,14 @@ def menu():
                 session, error = orch.login_usuario(email, password, trusted_device)
                 if error:
                     print(error)
+                    orch._pausa_ui("error")
                     continue
                 active_session = session
                 orch.registrar_login_evento(email, trusted_device)
                 tipo_sesion = orch._tipo_usuario_sesion(active_session)
                 print(f"\nBienvenido/a {session.get('nombre_completo', 'Usuario')} <{session.get('email', email)}> | Tipo: {tipo_sesion}.")
                 print(f"Dispositivo de confianza: {'Sí' if trusted_device else 'No'}")
+                orch._pausa_ui("exito")
                 continue
 
             elif opc == "0":
@@ -2479,6 +2705,7 @@ def menu():
 
             else:
                 print("\n⚠ Opción no válida. Intente nuevamente.")
+                orch._pausa_ui("error")
                 continue
 
         print("\n" + "=" * 30)
@@ -2511,9 +2738,39 @@ def menu():
                 break
         elif opc == "2" and tipo_sesion == "admin":
             print("\n--- Analítica rápida (reservas por ciudad / propiedades populares) ---")
-            ciudad = input("Ingrese la ciudad a filtrar para analítica (opcional, Enter para omitir): ").strip() or None
+            try:
+                ciudades_disponibles = orch.postgres.list_available_cities() if hasattr(orch.postgres, 'list_available_cities') else []
+            except Exception:
+                ciudades_disponibles = []
+
+            if ciudades_disponibles:
+                print("Ciudades disponibles para filtrar:")
+                for idx, ciudad_item in enumerate(ciudades_disponibles, start=1):
+                    print(f"  {idx}. {ciudad_item}")
+
+            ciudad = None
+            if ciudades_disponibles:
+                while True:
+                    entrada_ciudad = input("Ingrese el número de la ciudad para analítica (opcional, Enter para omitir): ").strip()
+                    if not entrada_ciudad:
+                        break
+                    if not entrada_ciudad.isdigit():
+                        print("Opción inválida. Debe ingresar un número de la lista.")
+                        continue
+
+                    indice_ciudad = int(entrada_ciudad)
+                    if 1 <= indice_ciudad <= len(ciudades_disponibles):
+                        ciudad = ciudades_disponibles[indice_ciudad - 1]
+                        break
+
+                    print("Índice de ciudad fuera de rango. Intente nuevamente.")
+            else:
+                ciudad = input("Ingrese la ciudad a filtrar para analítica (opcional, Enter para omitir): ").strip() or None
+
             if ciudad:
                 try:
+                    if ciudades_disponibles:
+                        print(f"Filtrando por ciudad: {ciudad}")
                     print(orch.contar_reservas_ciudad(ciudad))
                 except Exception as e:
                     print(f"Error analítica: {e}")
@@ -2529,12 +2786,14 @@ def menu():
                 continue
         elif opc == "0":
             print(orch.logout_usuario(active_session.get('email'), session_token=active_session.get('session_token')))
+            orch._pausa_ui("exito")
             active_session = None
             print("\nApagando orquestador...")
             orch.cerrar_conexiones()
             break
         else:
             print("\n⚠ Opción no válida. Intente nuevamente.")
+            orch._pausa_ui("error")
 
 
 if __name__ == "__main__":

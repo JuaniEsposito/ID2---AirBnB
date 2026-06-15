@@ -179,11 +179,40 @@ class MongoRepository:
         if self.collection is None:
             raise RuntimeError("MongoDB no conectado.")
         try:
+            query_id = ObjectId(property_id) if ObjectId.is_valid(property_id) else property_id
             res = self.collection.update_one(
-                {"_id": ObjectId(property_id) if ObjectId.is_valid(property_id) else property_id},
+                {"_id": query_id},
                 {"$push": {"resenas": review_doc}},
             )
-            return {"matched_count": res.matched_count, "modified_count": res.modified_count}
+
+            if res.matched_count:
+                propiedad = self.collection.find_one(
+                    {"_id": query_id},
+                    {"resenas.calificacion": 1, "calificacion_promedio": 1},
+                ) or {}
+                resenas = propiedad.get("resenas") if isinstance(propiedad.get("resenas"), list) else []
+                calificaciones = []
+                for resena in resenas:
+                    if not isinstance(resena, dict):
+                        continue
+                    calificacion = resena.get("calificacion")
+                    if calificacion is None:
+                        continue
+                    try:
+                        calificaciones.append(float(calificacion))
+                    except (TypeError, ValueError):
+                        continue
+
+                promedio = round(sum(calificaciones) / len(calificaciones), 2) if calificaciones else None
+                self.collection.update_one(
+                    {"_id": query_id},
+                    {"$set": {"calificacion_promedio": promedio, "cantidad_resenas": len(resenas)}},
+                )
+
+            return {
+                "matched_count": res.matched_count,
+                "modified_count": res.modified_count,
+            }
         except PyMongoError:
             raise
         except Exception:
@@ -206,6 +235,50 @@ class MongoRepository:
                 }
             },
             {"$sort": {"resena.fecha": -1}},
+            {"$limit": int(limit)},
+        ]
+        return list(self.collection.aggregate(pipeline))
+
+    def reviews_by_user_ids(self, user_ids, limit=50):
+        if self.collection is None:
+            raise RuntimeError("MongoDB no conectado.")
+
+        normalized_ids = []
+        for user_id in user_ids or []:
+            if user_id in (None, ""):
+                continue
+            normalized_ids.append(user_id)
+            normalized_ids.append(str(user_id))
+            if isinstance(user_id, str) and user_id.isdigit():
+                normalized_ids.append(int(user_id))
+
+        seen = set()
+        user_id_values = []
+        for value in normalized_ids:
+            key = (type(value).__name__, str(value))
+            if key in seen:
+                continue
+            seen.add(key)
+            user_id_values.append(value)
+
+        if not user_id_values:
+            return []
+
+        pipeline = [
+            {"$unwind": "$resenas"},
+            {"$match": {"resenas.usuario_id": {"$in": user_id_values}}},
+            {
+                "$project": {
+                    "titulo": 1,
+                    "tipo_propiedad": 1,
+                    "ciudad": "$ubicacion.ciudad",
+                    "fecha": "$resenas.fecha",
+                    "calificacion": "$resenas.calificacion",
+                    "comentario": "$resenas.comentario",
+                    "visible": "$resenas.visible",
+                }
+            },
+            {"$sort": {"fecha": -1}},
             {"$limit": int(limit)},
         ]
         return list(self.collection.aggregate(pipeline))

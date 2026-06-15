@@ -112,23 +112,23 @@ class CassandraRepository:
             if start <= row_date <= end:
                 available_by_day[row_date] = bool(row.get("disponible"))
 
-        missing_days = []
+        # Por defecto, los días sin registro en Cassandra están disponibles.
+        # Solo marcamos como no disponibles los días explícitamente reservados (disponible=False).
         unavailable_days = []
         current_day = start
         while current_day <= end:
-            if current_day not in available_by_day:
-                missing_days.append(current_day.isoformat())
-            elif not available_by_day[current_day]:
+            # Si el día está en la BD y tiene disponible=False, es un día ocupado/reservado
+            if current_day in available_by_day and not available_by_day[current_day]:
                 unavailable_days.append(current_day.isoformat())
             current_day += timedelta(days=1)
 
-        is_available = not missing_days and not unavailable_days
+        # Disponible = no hay días explícitamente no disponibles
+        is_available = not unavailable_days
         return {
             "property_id": property_id,
             "start_date": start.isoformat(),
             "end_date": end.isoformat(),
             "available": is_available,
-            "missing_days": missing_days,
             "unavailable_days": unavailable_days,
             "days_checked": expected_days,
         }

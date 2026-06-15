@@ -1391,6 +1391,28 @@ class PostgresRepository:
             self.connection.rollback()
             raise
 
+    def list_available_countries(self):
+        if not self.connection or not self.cursor:
+            raise RuntimeError("Conexión a Postgres no disponible.")
+
+        try:
+            if not self._table_has_columns("ubicacion", ["pais"]):
+                return []
+
+            self.cursor.execute(
+                """
+                SELECT DISTINCT TRIM(pais) AS pais
+                FROM ubicacion
+                WHERE TRIM(COALESCE(pais, '')) <> ''
+                ORDER BY pais ASC;
+                """
+            )
+            rows = self.cursor.fetchall() or []
+            return [row[0] for row in rows if row and row[0]]
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def count_reservations_by_city_last_month(self, city):
         if not self.connection or not self.cursor:
             raise RuntimeError("Conexión a Postgres no disponible.")

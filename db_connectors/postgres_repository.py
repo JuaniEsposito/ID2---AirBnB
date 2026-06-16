@@ -7,6 +7,10 @@ from psycopg2 import Error as Psycopg2Error
 class PostgresRepository:
     def __init__(self, dsn=None):
         self.dsn = dsn or os.getenv("POSTGRES_URI")
+        try:
+            self.connect_timeout = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5"))
+        except Exception:
+            self.connect_timeout = 5
         self.connection = None
         self.cursor = None
         self.connect()
@@ -19,7 +23,7 @@ class PostgresRepository:
             self.connection = psycopg2.connect(
                 self.dsn,
                 sslmode="require",
-                connect_timeout=10,
+                connect_timeout=self.connect_timeout,
             )
             self.cursor = self.connection.cursor()
             return True

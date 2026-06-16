@@ -12,6 +12,10 @@ class MongoRepository:
         self.uri = uri or os.getenv("MONGO_URI")
         self.database_name = database_name or os.getenv("MONGO_DB_NAME", "ID2")
         self.collection_name = collection_name or os.getenv("MONGO_COLLECTION_NAME", "propiedades")
+        try:
+            self.server_selection_timeout_ms = int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "4000"))
+        except Exception:
+            self.server_selection_timeout_ms = 4000
         self.client = None
         self.db = None
         self.collection = None
@@ -22,7 +26,7 @@ class MongoRepository:
             return False
 
         try:
-            self.client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
+            self.client = MongoClient(self.uri, serverSelectionTimeoutMS=self.server_selection_timeout_ms)
             self.db = self.client[self.database_name]
             self.collection = self.db[self.collection_name]
             return True

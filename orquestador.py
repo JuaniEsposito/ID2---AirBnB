@@ -39,6 +39,11 @@ class AirbnbOrchestrator:
 
         # Conectar las 4 bases en paralelo para reducir el tiempo de arranque.
         results = {}
+        connector_names = ["postgres", "mongo", "cassandra", "redis"]
+        try:
+            max_wait_seconds = float(os.getenv("DB_INIT_MAX_WAIT_SECONDS", "6"))
+        except Exception:
+            max_wait_seconds = 6.0
 
         def _connect(name, factory):
             try:
@@ -54,8 +59,21 @@ class AirbnbOrchestrator:
         ]
         for t in threads:
             t.start()
+
+        # Espera acotada: no bloquear arranque completo si una base tarda demasiado.
+        wait_start = time.monotonic()
         for t in threads:
-            t.join()
+            remaining = max_wait_seconds - (time.monotonic() - wait_start)
+            if remaining <= 0:
+                break
+            t.join(timeout=remaining)
+
+        for name, t in zip(connector_names, threads):
+            if name not in results:
+                if t.is_alive():
+                    results[name] = TimeoutError(f"Timeout conectando {name}.")
+                else:
+                    results[name] = RuntimeError(f"Fallo desconocido conectando {name}.")
 
         self.postgres   = results["postgres"]   if not isinstance(results["postgres"],   Exception) else PostgresRepository.__new__(PostgresRepository)
         self.mongo      = results["mongo"]      if not isinstance(results["mongo"],      Exception) else MongoRepository.__new__(MongoRepository)
@@ -66,10 +84,22 @@ class AirbnbOrchestrator:
         for attr in ("connection", "cursor"):
             if not hasattr(self.postgres, attr):
                 setattr(self.postgres, attr, None)
+        if not hasattr(self.mongo, "client"):
+            self.mongo.client = None
+        if not hasattr(self.mongo, "db"):
+            self.mongo.db = None
         if not hasattr(self.mongo, "collection"):
             self.mongo.collection = None
+        if not hasattr(self.cassandra, "client"):
+            self.cassandra.client = None
+        if not hasattr(self.cassandra, "db"):
+            self.cassandra.db = None
         if not hasattr(self.cassandra, "collection"):
             self.cassandra.collection = None
+        if not hasattr(self.cassandra, "availability_table"):
+            self.cassandra.availability_table = None
+        if not hasattr(self.cassandra, "visits_table"):
+            self.cassandra.visits_table = None
         if not hasattr(self.redis, "client"):
             self.redis.client = None
 
@@ -154,6 +184,17 @@ class AirbnbOrchestrator:
     def _migrar_roles_legacy(self):
         # Migrate legacy role value "ambos" to "huesped" in Redis and Postgres.
         try:
+            max_seconds = float(os.getenv("LEGACY_ROLE_MIGRATION_MAX_SECONDS", "1.5"))
+        except Exception:
+            max_seconds = 1.5
+        try:
+            max_users = int(os.getenv("LEGACY_ROLE_MIGRATION_MAX_USERS", "100"))
+        except Exception:
+            max_users = 100
+
+        started_at = time.monotonic()
+
+        try:
             self.postgres.migrar_tipos_usuario_legacy(from_tipo="ambos", to_tipo="huesped")
         except Exception:
             pass
@@ -167,7 +208,13 @@ class AirbnbOrchestrator:
             return
 
         try:
+            processed = 0
             for raw_key in self.redis.client.scan_iter(match="auth:user:*"):
+                if processed >= max_users:
+                    break
+                if (time.monotonic() - started_at) > max_seconds:
+                    break
+
                 key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
                 user_doc = self.redis.get_json(key) or {}
                 tipo_actual = user_doc.get("tipo")
@@ -183,6 +230,8 @@ class AirbnbOrchestrator:
                         self.postgres.actualizar_tipo_usuario_por_email(email, tipo_normalizado)
                     except Exception:
                         pass
+
+                processed += 1
         except Exception:
             pass
 

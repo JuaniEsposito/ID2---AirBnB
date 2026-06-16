@@ -128,6 +128,10 @@ class RedisRepository:
     def __init__(self, url=None, token=None):
         self.url = url or os.getenv("UPSTASH_REDIS_REST_URL")
         self.token = token or os.getenv("UPSTASH_REDIS_REST_TOKEN")
+        try:
+            self.timeout_seconds = float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "2.5"))
+        except Exception:
+            self.timeout_seconds = 2.5
         self.client = None
         self.connect()
 
@@ -138,12 +142,12 @@ class RedisRepository:
         try:
             parsed = urlparse(self.url if "://" in self.url else f"https://{self.url}")
             if parsed.scheme in ("http", "https"):
-                self.client = UpstashRestClient(self.url, self.token, timeout=3)
+                self.client = UpstashRestClient(self.url, self.token, timeout=self.timeout_seconds)
             else:
                 host = parsed.hostname or self.url
                 port = parsed.port or 6379
                 use_ssl = parsed.scheme == "rediss"
-                self.client = redis.Redis(host=host, port=port, password=self.token, ssl=use_ssl, socket_timeout=3)
+                self.client = redis.Redis(host=host, port=port, password=self.token, ssl=use_ssl, socket_timeout=self.timeout_seconds)
             self.client.ping()
             return True
         except Exception:
